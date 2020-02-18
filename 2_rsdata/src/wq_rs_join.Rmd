@@ -1,0 +1,208 @@
+---
+title: "1_sr_wq_rs_join"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+# A unified water quality portal and landsat dataset
+
+```{r setup}
+library(googledrive)
+library(tidyverse)
+library(feather)
+library(lubridate)
+#library(scipiper)
+#knitr::opts_knit$set(root.dir='../..')
+```
+
+## Summary data
+
+
+```{r stitch}
+#Stitch all data together
+#The long string of letters is readr's sweet way of compressing Column types
+#I'm forcing them here because the first file happens to be all NAs 
+# so all columns get coerced to character
+#down.paths <- list.files('2_rsdata/out/sr_matchups',full.names = T)
+
+
+down.paths <- list.files('D:/GoogleDrive/WQP_SR_MatchUps_dswe_v2',full.names = T)
+
+sr <- map_df(down.paths,read_csv,col_types='icnnDTnnnnnnnnnnnnnnnnnnnc') %>% 
+  arrange(SiteID, date_unity)
+
+sr_noon <- sr %>%
+  mutate(endtime = as.character(format(date_unity, '%H:%M:%S'))) %>%
+  mutate(date_unity = ifelse(endtime == '00:00:00',
+                             date_unity + hours(12),
+                             date_unity) %>%
+           as.POSIXct(.,origin='1970-01-01 00:00:00',tz='UTC')) 
+
+
+```
+
+
+### full data
+
+```{r}
+#Read in the in situ data
+wide.pull <- read_feather('2_rsdata/out/wide_pull_v3.feather') %>%
+  distinct_at(vars(SiteID, date_utc, date, sat, PATH, ROW, landsat_id,
+                   time, clouds, lat, long, source, chl_a, doc, p_sand, tss, tis, secchi), .keep_all = T)
+
+#wide.pull.old <- read_feather("D:/Dropbox/projects/TSS/output/wide_pull_v2.feather")
+
+#wide.pull.old2<- read_feather("D:/Dropbox/projects/TSS/output/wide_pull.feather")
+
+#wide.pull.old2  %>% group_by(source) %>% summarise(count= n())
+
+# 
+# #visibility
+visible <- read_feather('2_rsdata/out/unique_site_visible_inv_v2.feather') %>%
+  select(SiteID,pwater=med) %>%
+  mutate(SiteID=gsub('lagos-','',SiteID)) %>%
+  arrange(SiteID, desc(pwater)) %>%
+  distinct(SiteID, .keep_all = TRUE)
+
+# dups2 <- visible %>%
+#   group_by(SiteID) %>%
+#   filter(n() > 1) %>%
+#   arrange(SiteID)
+# 
+
+#Join reflectance to in situ with some very minor pixelCount and cloudiness filters
+# sr.clean <- sr %>%
+#   filter_at(vars(blue,green,red,nir,swir1,swir2),any_vars(!is.na(.))) %>% #NAs are useless
+#   inner_join(wide.pull %>%
+#     rename(path=PATH) %>%
+#     rename(row=ROW),
+#     by=c('SiteID','date','sat','date_unity','path','row')) %>%
+#   left_join(visible,by='SiteID') %>%
+#   arrange(SiteID, date)
+
+#Join reflectance to in situ with some very minor pixelCount and cloudiness filters
+sr.clean <- sr_noon %>%
+  select(-date) %>%
+  filter_at(vars(blue,green,red,nir,swir1,swir2),any_vars(!is.na(.))) %>% #NAs are useless
+  inner_join(wide.pull %>%
+               rename(path=PATH) %>%
+               rename(row=ROW),
+             by=c('SiteID','date_unity','path','row','sat')) %>%
+  left_join(visible,by='SiteID')
+
+#Add type info to data frame
+full.inv.raw <- read_feather('2_rsdata/out/wqp_lagos_usgs_inventory.feather') 
+
+full.inv <- full.inv.raw %>%
+  select(SiteID, type=ResolvedMonitoringLocationTypeName) %>%
+  distinct() %>%
+  mutate(type = ifelse(grepl('Lake',type),'Lake',type))
+
+sr.type <- sr.clean %>%
+  left_join(full.inv,by='SiteID') %>%
+  mutate(type=ifelse(is.na(type),'Lake',type)) %>%
+  ungroup() # %>%
+  #mutate(timediff = difftime(date_unity,time,units='hours'))
+
+#hist(as.numeric(sr.type$timediff))
+##
+long.pull.methods <- read_feather('2_rsdata/out/wqp_lagos_usgs_long_methods.feather') %>%
+  arrange(SiteID, date) 
+
+#
+wide.pull.methods <- long.pull.methods %>%
+  spread(key = harmonized_parameter, value=harmonized_value)
+
+# conc_long %>% filter(harmonized_parameter=="tss") %>% summarise(methods =unique(analytical_method))
+# 
+# unique(conc_long$analytical_method)
+# full.inv <- full.inv.raw %>%
+#   select(SiteID = MonitoringLocationIdentifier,type=ResolvedMonitoringLocationTypeName) %>%
+#   distinct() %>%
+#   mutate(type = ifelse(grepl('Lake',type),'Lake',type))
+
+wide.pull.info <- wide.pull %>%
+  select(-tis, -chl_a:tss)
+
+long.pull <- wide.pull %>%
+  select(SiteID:date_only, source, tis, chl_a:timediff) %>%
+  rename(chl.a=chl_a, p.sand=p_sand) %>%
+  gather(harmonized_parameter, harmonized_value, tis:tss) %>%
+  filter(!is.na(harmonized_value)) %>%
+  arrange(SiteID, date)
+
+
+#test %>% group_by(characteristicName) %>% summarise(n=n())
+
+### there is missing data beacuse need to make long_with_methods with new usgs
+long_join <- left_join(long.pull, long.pull.methods, by=c('harmonized_parameter','SiteID', 'date_unity')) %>%
+  distinct(SiteID, date_unity, PATH, ROW, sat, harmonized_parameter, harmonized_value.x,
+           .keep_all=T)  %>%
+  select(-source.x, -time.y, -harmonized_value.x, -date.y, -value) %>%
+  rename(value = harmonized_value.y, date=date.x, time = time.x, source = source.y, parameter = harmonized_parameter) %>%
+  arrange(SiteID, date_unity) 
+
+
+sr.clean.long <- sr_noon %>%
+  dplyr::select(-date) %>%
+  filter_at(vars(blue,green,red,nir,swir1,swir2),any_vars(!is.na(.))) %>%
+  inner_join(long_join %>%
+  rename(path=PATH) %>%
+  rename(row=ROW),
+  by=c('SiteID', 'date_unity','path','row', 'sat')) %>%
+  left_join(visible,by='SiteID') %>%
+
+  left_join(full.inv,by='SiteID') %>%
+  mutate(type=ifelse(is.na(type),'Lake',type)) %>%
+  ungroup() 
+
+
+# this datasat has some duplicates, remove for each consituent
+sr.clean.wide <- sr.clean.long %>%
+  spread(key=parameter, value= value) 
+
+# this datasat has some duplicates, remove for each consituent
+dups.long <- sr.clean.long %>%
+  group_by(SiteID, date_unity, sat, lat, long, path, row, red, green, blue, nir, swir1, swir2 ,parameter, source, type, characteristicName, value) %>%
+  mutate(n = n()) %>%
+  filter(n >1)
+
+write_feather(sr.clean.wide, "2_rsdata/out/wq_rs_join_with_method_v2.feather")
+
+write_feather(sr.clean.long, "2_rsdata/out/wq_rs_join_long_with_method_v2.feather")
+
+write_feather(sr.type, "2_rsdata/out/wq_rs_join_v2.feather")
+
+# sr.type <- sr.clean %>%
+#  # left_join(full.inv,by='SiteID') %>%
+#   rename(type = ResolvedMonitoringLocationTypeName) %>%
+#   mutate(type=ifelse(is.na(type),'Lake',type)) %>%
+#   ungroup() %>%
+#   mutate(timediff = difftime(date_unity,time,units='hours')) %>%
+#   select(`system:index`:date_only, source, chl_a, doc, p_sand, secchi, tis, tss, type:pwater)
+
+
+#Setup save path
+#data_file <- 'output/sr_wq_rs_join_test.csv'
+
+#Save it locally as a csv file
+#write_csv(sr.type,path=data_file)
+
+test <-sr.clean.long %>% filter(parameter == "tss") %>%
+  filter(value >1, red < 10000, red >1) # %>%
+  #filter(!characteristicName %in% c("Suspended sediment concentration (SSC)","Suspended Sediment Concentration (SSC)" ))
+  
+ggplot(data= test, aes(x=value, y=green/nir)) + geom_point() +
+  scale_x_log10()
+
+
+```
+
+```{r}
+#Upload data to team drive
+#gd_put(scipiper::as_ind_file(data_file), data_file)
+```
+
+
