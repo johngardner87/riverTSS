@@ -1,0 +1,493 @@
+---
+title: "1_nhd_join_and_munge"
+author: "Simon Topp and John Gardner"
+date: "11/15/2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# This script takes the downloaded reflectance data from Google Earth Engine and joins it back up with the original water quality information as well as nhd data
+
+```{r setup, eval = F}
+library(googledrive)
+library(tidyverse)
+library(feather)
+library(viridis)
+library(knitr)
+library(sf)
+library(rgdal)
+library(maps)
+library(magrittr)
+library(mlbench)
+library(caret)
+library(randomForest)
+library(doParallel)
+library(furrr)
+library(kableExtra)
+library(dataRetrieval)
+library(hydrolinks)
+library(USAboundaries)
+library(RCurl)
+library(httr)
+library(nhdplusTools)
+library(tmap)
+library(devtools)
+
+```
+
+## Load in the downloaded data from AquaSat
+
+```{r download, eval = F}
+
+sr_full <- read_feather("2_rsdata/out/wq_rs_join_long_with_method_v2.feather") %>%
+  distinct_at(vars(SiteID, date_unity, sat, lat, path, row, red, green, blue, nir, swir1, swir2 , parameter, source, type, characteristicName, value), .keep_all = T)
+  
+## download  nhdplus 
+#devtools::install_github("jimhester/archive")
+#library(RCurl)
+
+#url = "https://s3.amazonaws.com/nhdplus/NHDPlusV21/Data/NationalData/NHDPlusV21_NationalData_#CONUS_Seamless_Geopackage_05.7z"
+#temp <- tempfile()
+#download.file('https://s3.amazonaws.com/nhdplus/NHDPlusV21/Data/NationalData/NHDPlusV21_Natio#nalData_Seamless_Geodatabase_03.7z',temp) #,method='wget')
+#system('7z e -o D:/projects/TSS/data/nhd data/nhd_plus.7z')
+
+```
+
+
+## Examine the distribution of the samples
+```{r}
+
+sr_lake <- sr_full %>%
+  filter(type =="Lake", 
+         parameter != "p.sand",
+         !is.na(value))
+  
+sr_sf <- st_as_sf(sr_lake,coords=c('long','lat'),crs=4326) %>%
+    st_transform(.,2163)
+
+usa <- st_as_sf(map('usa',plot=F,fill=T)) %>%
+    st_transform(.,2163) %>%
+    st_buffer(.,0) 
+
+## Emily Read code to download huc8s
+#library(httr)
+#
+# get_mutate_HUC8s <- function(wfs = "http://cida.usgs.gov/gdp/geoserver/wfs",
+#                             feature = "derivative:wbdhu8_alb_simp",
+#                             plot_CRS = "+init=epsg:2163"){
+#  destination <- tempfile(pattern = 'huc_shape', fileext='.zip')
+#  query <- sprintf('%s?service=WFS&request=GetFeature&typeName=%s&outputFor#mat=shape-zip&version=1.0.0', wfs, feature)
+#  file <- GET(query, write_disk(destination, overwrite=T), progress())
+#  shp.path <- tempdir()
+#  unzip(destination, exdir = shp.path)
+#  layer <- strsplit(feature,'[:]')[[1]][2]
+#  hucs <- st_read(shp.path) %>%
+#    st_transform(.,2163)
+#  unlink(destination)
+#  return(hucs)
+# }
+# 
+# hucs <- get_mutate_HUC8s() %>% st_as_sf(.) %>%
+#   st_transform(.,2163)
+
+#st_write(hucs, dsn = 'D:/projects/TSS/data/hucs.shp')
+
+hucs <- st_read('D:/projects/TSS/data/hucs.shp')
+
+huc_sr_sf <- st_join(hucs,sr_sf) %>%
+  as_tibble() %>%
+  group_by(HUC_8, parameter) %>%
+  summarize(Overpasses=n()) %>%
+  filter(Overpasses > 0) %>%
+  left_join(hucs, by = 'HUC_8') %>%
+  filter(!is.na(parameter))
+
+sr_stream <- sr_full %>%
+  filter(type =="Stream", 
+         parameter != "p.sand",
+         !is.na(value))
+
+sr_sf_stream <- st_as_sf(sr_stream,coords=c('long','lat'),crs=4326) %>%
+    st_transform(.,2163) 
+  
+huc_sr_sf_stream <- 
+  st_join(hucs,sr_sf_stream) %>%
+ # as_tibble() %>%
+  group_by(HUC_8, parameter) %>%
+  summarize(Overpasses=n()) %>%
+  filter(Overpasses > 0) %>%
+  ungroup() %>%
+  filter(!is.na(parameter))
+
+ ggplot() +
+   geom_sf(data = usa, fill = 'grey90') + 
+   geom_sf(data = huc_sr_sf_stream,aes(fill=Overpasses),color=NA)  + 
+   scale_fill_gradient2(low='#a50026',mid='#abd9e9', high='#313695',na.value='black',midpoint=2,trans='log10', name = 'Cloud Free Overpasses') +
+   facet_wrap(~parameter) +
+   theme_bw() +
+   theme(legend.position = 'bottom', 
+         legend.direction = 'horizontal',
+         legend.title = element_text(size = 10))
+ 
+#ggsave(filename='figs/OverpassMapGrey90_2.tiff',width=7.5,height=6,units='in', dpi = 350)
+
+```
+
+## Join the data to HydroLakes and NHD to extract additional landscape and lake specific variables
+
+```{r packages_sites, eval=TRUE, echo=TRUE, include=TRUE}
+
+nhdplusTools::nhdplus_path("D:/projects/TSS/data/NHDPlusNationalData/NHDPlusV21_National_Seamless_Flattened_Lower48.gdb")
+
+nhd_paths <- nhdplusTools::stage_national_data(output_path = 'D:/projects/TSS/data/NHDPlusNationalData')
+
+lakes <- sf::st_read(dsn="D:/projects/TSS/data/NHDPlusNationalData/NHDPlusV21_National_Seamless_Flattened_Lower48.gdb", layer = "NHDWaterbody") %>%
+  filter(FTYPE %in% c("LakePond", "Reservoir", "Playa"))
+
+sr <- sr_full %>%
+  filter(parameter != "p.sand", !is.na(value))
+
+## Join SR data with Hydrolakes
+plan(multiprocess(workers = availableCores()-2))
+ 
+hydroJoin <- sr_lake %>%
+   select(SiteID, lat, long) %>%
+   distinct() %>%
+   #sample_n(20) %>%
+   split(.,c(1:10)) %>%
+   future_map(~link_to_waterbodies(lats = .$lat, lons = .$long, ids = .$SiteID, buffer = 0, dataset = 'hydrolakes')) 
+ 
+plan(sequential)
+
+hydrolakesout <- hydroJoin %>%
+  reduce(bind_rows)
+
+#write_feather(hydrolakesout,'3_prepdata/out/hydroLakesJoin.feather')
+
+# Join SR data with NHDplusV2 lakes
+plan(multiprocess(workers = availableCores()-2))
+
+nhdJoin_lakes <- sr_lake %>%
+  select(SiteID, lat, long) %>%
+  distinct() %>%
+  #sample_n(20) %>%
+  split(.,c(1:10)) %>%
+  future_map(~link_to_waterbodies(lats = .$lat, lons = .$long, ids = .$SiteID, buffer = 100, dataset = 'nhdplusv2')) 
+ 
+plan(sequential)
+
+nhdPlusOut_lakes <- nhdJoin_lakes %>%
+  reduce(bind_rows)
+
+#write_feather(nhdPlusOut_lakes,'3_prepdata/out/nhdPlus_lakes_v2.feather')
+
+# Link SR data to NhdplusV2 rivers
+# Read in NHDplusV2 flowlines
+flowline <- readRDS(nhd_paths$flowline) %>%
+   filter(!FTYPE %in% c("Pipeline", "Coastline")) %>%
+   filter(StreamOrde == StreamCalc) %>% 
+   filter(StreamOrde > 2) %>%
+   select(-contains("_0")) %>%
+   select(-contains("_1")) %>%
+   st_transform(4326)
+
+sr_stream_points <- sr_stream %>%
+  select(SiteID, lat, long) %>%
+  distinct() %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+  
+nhdJoin_rivers <- get_flowline_index(flines = flowline,  search_radius=0.5, points = sr_stream_points) 
+
+nhdPlusOut_rivers <- bind_cols(sr_stream_points, nhdJoin_rivers) %>%
+  st_set_geometry(NULL)
+
+# lakes that are on network, find closest flowline
+sr_lake_points <- nhdPlusOut_lakes %>%
+  rename(COMID=comid) %>%
+  left_join(select(lakes, COMID, FTYPE, FCODE, ONOFFNET, MeanDepth,
+                   LakeVolume, MaxDepth, LakeArea), by="COMID") %>%
+  select(-fdate, -resolution, -shape_leng, -shape_area, -centroid_x,
+         -centroid_y, -Shape) %>%
+  rename_all(function(x) paste0(x,"_lake")) %>%
+  dplyr::filter(ONOFFNET_lake ==1)  %>%
+  left_join(sr_lake %>%
+              dplyr::select(SiteID, lat, long) %>%
+              distinct(SiteID, .keep_all=T),
+            by = c("MATCH_ID_lake" = "SiteID")) %>%
+  rename(SiteID = MATCH_ID_lake) %>%
+  select(SiteID, lat, long) %>%
+  distinct() %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+  
+nhdJoin_rivers_lakes <- get_flowline_index(flines = flowline,  search_radius=0.5, points = sr_lake_points) 
+
+nhdPlusOut_rivers_lakes <- bind_cols(sr_lake_points, nhdJoin_rivers_lakes) %>%
+  st_set_geometry(NULL)
+
+nhdPlusOut_all_rivers <- bind_rows(nhdPlusOut_rivers,
+                                  nhdPlusOut_rivers_lakes)
+
+#write_feather(nhdPlusOut_all_rivers,'3_prepdata/out/nhdPlus_rivers_lakes_v2.feather')
+#write_feather(nhdPlusOut_rivers,'3_prepdata/out/nhdPlus_rivers_v2.feather')
+
+```
+
+## Connect WQP and Lagos sites to NHD and Hydrolakes data
+
+```{r}
+
+## subset nhd lakes that are in-network by comid
+library(data.table)
+library(naniar)
+
+nhd_rivers <- read_feather('3_prepdata/out/nhdPlus_rivers_lakes_v2.feather') %>%
+  # remove rows with large distance between point-line
+  #filter(offset < 0.2) %>%  
+  select(-REACHCODE) %>%
+  left_join(flowline %>% st_set_geometry(NULL), 
+            by = "COMID")
+
+nhdPlusOut_lakes <- read_feather('3_prepdata/out/nhdPlus_lakes_v2.feather')
+
+## 6973 unique lakes with SR data and on network link to waterbodies
+nhd_lakes <- nhdPlusOut_lakes %>%
+  rename(COMID=comid) %>%
+  left_join(select(lakes, COMID, FTYPE, FCODE, ONOFFNET, MeanDepth,
+                   LakeVolume, MaxDepth, LakeArea), by="COMID") %>%
+  select(-fdate, -resolution, -shape_leng, -shape_area, -centroid_x,
+         -centroid_y, -Shape) %>%
+  rename_all(function(x) paste0(x,"_lake")) 
+
+sr_nhd_join <- sr %>% 
+  left_join(nhd_rivers, by="SiteID") %>%
+  left_join(nhd_lakes, by=c("SiteID" = "MATCH_ID_lake")) 
+
+# write_feather(sr_nhd_join, "3_prepdata/out/sr_full_nhd_join_v3.feather")
+
+## Connect it all to the nhd upstream data previously downloaded from StreamCat and... https://www.sciencebase.gov/catalog/item/5669a79ee4b08895842a1d47
+sc.files <- list.files('D:/projects/TSS/data/NHD_attributes', full.names = T)
+
+nhd_metrics <- lapply(sc.files, fread) %>%
+  purrr::reduce(left_join, by = "COMID")
+
+nhd_metrics_clean <- nhd_metrics %>%
+  filter(COMID > 0) %>%
+  select(-contains("NODATA")) %>%
+  na_if(-9999)
+
+#write_feather(nhd_metrics_clean, "output/nhd_metrics.feather")
+
+## plot histograms of metrics for data QA
+nhd_metrics_clean %>%
+  select(281:296) %>%
+  gather() %>%
+  ggplot(aes(value)) +
+  facet_wrap(~key, scales="free") + geom_histogram() +
+  scale_x_log10()
+
+sr_full_join <- sr_nhd_join %>%
+ # filter(!is.na(COMID)) %>%
+  left_join(nhd_metrics_clean, by = 'COMID')
+
+# check if on network lakes have river COMID, most do
+sr_full_join %>% filter(type=="Lake") %>%
+  group_by(ONOFFNET_lake) %>% summarise(n=n(),
+                             l=sum(is.na(TOT_BASIN_AREA)))
+
+#write_feather(sr_full_join, "3_prepdata/out/sr_full_nhd_join_metrics_v3.feather")
+
+join.filt <- sr_full_join %>%
+  distinct(SiteID, .keep_all = T) %>%
+  dplyr::select(SiteID, COMID:tail(names(.),1)) 
+
+#write_feather(join.filt, '3_prepdata/out/NHDbySite.feather')
+
+```
+
+
+```{r correctBands}
+
+correction_coef <- read_csv("D:/Dropbox/projects/rivercolor/out/ls_poly_correction_coef.csv")
+
+# filter poly coeficients with 1-99 % quantiles
+correction_coef_99 <- correction_coef %>%
+  filter(fit %in% c(NA, "98_quant")) %>%
+  dplyr::select(-fit)
+
+# this takes too long
+sr_clean <- sr %>%
+  mutate(sat = case_when(
+      sat == "5" ~ "LT05",
+      sat == "7" ~ "LE07",
+      sat == "8" ~ "LC08")) %>%
+  mutate(rn = row_number()) %>%
+  gather(red ,green, blue, nir, swir1, swir2, key='band', value='sr') %>%
+  group_by(band, sat) %>%
+  left_join(correction_coef_99, by=c("band", "sat")) %>%
+  mutate(sr_cor=  coef2*sr^ 2 + coef1*sr + intercept) %>%
+  ungroup() %>%
+  mutate(sr_cor = ifelse(sr_cor <=0, sr, sr_cor)) %>%
+  dplyr::select(-intercept, -coef1, -coef2) %>%
+
+  pivot_wider(names_from = band,
+              values_from = c("sr", "sr_cor"))  %>%
+    rename_at(vars(starts_with("sr_")),
+           function(x) stringr::str_replace_all(x, "sr_", "")) %>%
+    rename_at(vars(red, green, blue, nir, swir1, swir2),function(x) paste0(x,"_raw")) %>%
+    rename_at(vars(starts_with("cor")), list(~stringr::str_replace_all(., "cor_", ""))) 
+
+#write_feather(sr_clean, "D:/Dropbox/projects/riverTSS/2_rsdata/out/sr_full_corrected_v2.feather")
+
+```
+
+## Workflow for creating munged parameter dataframe from fully joined reflectance, NHD, and hydrolakes data.
+```{r}
+# add band correction workflow 
+
+source("D:/Dropbox/projects/rivercolor/src/color_functions.R")
+
+param.nest <- function(df, dswe = 2, minPix = 2, maxClouds = 50, maxRef = 10000, minRef = 1){
+  
+  param = df$param[1]
+  minValue = 0.001
+  maxValue = quantile(df$value, .999)
+  
+  if(param == 'doc'){
+    minValue = 0.1  #from sobek 2007
+    maxValue = 350}
+  if(param == 'chl_a'){
+    minValue = 0.001 #from NLA 2012 minimum detection limit
+    maxValue = 2000}  #1146 # 1.5* max reported
+  if(param == 'tss'){
+    minValue = 0.001 
+    maxValue = 100000} 
+  if(param == 'tis'){
+    minValue = 0.001 
+    maxValue = 100000} 
+  if(param == 'secchi'){
+    minValue = 0.01
+    maxValue = 45} #deepest recorded lake sdd by Larson et al 2007
+  set.seed(52)
+  
+  maxRGB <- df  %>%
+    dplyr::select(red, green, blue) %>%
+    dplyr::summarise(maxRGB = max(., na.rm=T)) 
+    
+  maxRGB <- maxRGB$maxRGB
+    
+  data <- df %>%
+    dplyr::filter( 
+         pixelCount > minPix,
+         clouds < maxClouds,
+         dswe <= 2,
+         value >= minValue,
+         value <= maxValue,
+         blue <= maxRef,
+         blue >= minRef,
+         green <= maxRef,
+         green >= minRef,
+         red <= maxRef,
+         red >= minRef,
+         nir <= maxRef,
+         nir >= minRef,
+         swir1 <= maxRef,
+         swir1 >= minRef,
+         swir2 <= maxRef,
+         swir2 >= minRef) %>%
+    dplyr::mutate(NR = nir/red,
+                  BR = blue/red,
+                  GR = green/red,
+                  SR = swir1/red,
+                  BG = blue/green,
+                  RG = red/green, 
+                  NG = nir/green,
+                  SG = swir1/green,
+                  BN = blue/nir,
+                  GN = green/nir,
+                  RN = red/nir,
+                  SN = swir1/nir,
+                  BS = blue/swir1,
+                  GS = green/swir1,
+                  RS = red/swir1,
+                  NS = nir/swir1,
+                  R.GN = red/ (green + nir),
+                  R.GB = red/ (green + blue),
+                  R.GS = red/ (green + swir1),
+                  R.BN = red/ (blue + nir),
+                  R.BS = red/ (blue + swir1),
+                  R.NS = red/ (nir + swir1),
+                  G.BR = green/ (blue + red),
+                  G.BN = green / (blue + nir),
+                  G.BS = green / (blue + swir1),
+                  G.RN = green / ( red + nir),
+                  G.RB = green / (red + blue),
+                  G.NS = green / (nir + swir1),
+                  B.RG = blue / (red + green),
+                  B.RN = blue / (red + nir),
+                  B.RS = blue / (red + swir1),
+                  B.GN = blue / (green + nir),
+                  B.GS = blue / (green + swir1),
+                  B.NS = blue / (nir + swir1),
+                  N.RG = nir / (red + green),
+                  N.RB = nir / (red + blue),
+                  N.RS = nir / (red + swir1),
+                  N.GB = nir / (green + blue),
+                  N.GS = nir / (green + swir1),
+                  N.BS = nir / (blue  + swir1),
+                  
+                  GR2 = (green + red) / 2,
+                  GN2 = (green + nir) / 2,
+                  #blooms
+                  BR_G = (blue - red) / green,
+                  NS_NR = (nir - swir1) / (red - swir1),
+                  fai = nir - (red + (swir1-red)*((830-660)/(1650-660))),
+                  N_S= nir - swir1,
+                  N_R = nir- red,
+                  #
+                  ndvi = ((nir-red)/(nir+red)),
+                  ndwi = ((green- swir1)/(green + swir1)),
+                  ndssi = ((blue - nir)/ (blue + nir)),
+                  gn.gn= ((green- nir)/ (green + nir)),
+                  hue = rgb2hsv(r=red, g=green, b=blue, maxColorValue = maxRGB)[1,],
+                  saturation = rgb2hsv(r=red, g=green,  b=blue, maxColorValue = maxRGB)[2,],
+                  bright = rgb2hsv(r=red, g=green,  b=blue, maxColorValue = maxRGB)[3,],
+                  bright_tot = (red + green + nir +blue),
+                  dw = chroma(R=red, G=green, B=blue),
+                  hexcolor = rgb(r=red, g=green, b=blue, maxColorValue = maxRGB)) %>%
+    ungroup() %>%
+    dplyr::select(-c('system:index', qa, qa_sd, param))
+
+return(data)
+}
+
+# remove objects
+rm(lakes, flowline, site.candidates, clouds, results_nnet, wqp.nest, wqp.lagos.usgs.unity)
+
+plan(multiprocess(workers = availableCores()-2))
+
+# make full merges final matchup database
+cons.nest <- sr_clean %>% 
+  dplyr::select(-.geo) %>%
+ # gather(key = 'parameter', value = 'value', chl_a:tss, na.rm = T) %>%
+  mutate(param = parameter) %>%
+  group_by(parameter) %>%
+  nest() %>%
+  mutate(con.df = furrr::future_map(data, param.nest, .progress = T))
+
+plan(sequential)
+
+cons.out <- map2_df(cons.nest$con.df, cons.nest$parameter, ~update_list(.x, parameter = .y))
+
+## Join munged full data to NHD and Hydrolakes dataset.
+cons.out.join <- cons.out %>%
+  left_join(join.filt, by = 'SiteID') %>%
+  #remove duplicate values
+  distinct(value, sat, date, date_utc, lat, long, parameter,blue, .keep_all = T) %>%
+ dplyr::mutate(uniqueID = row_number()) 
+
+#write_feather(cons.out.join, '3_prepdata/out/parametersMunged_corrected_v4.feather')
+
+```
+
+

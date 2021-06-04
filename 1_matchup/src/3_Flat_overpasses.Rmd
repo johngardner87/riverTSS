@@ -1,0 +1,197 @@
+ ---
+title: "Flat_Overpasses"
+author: "Matt Ross, Xiao Yang, Simon Topp, Alison Appling, John Gardner"
+date: "June 24, 2019"
+output: html_document
+---
+
+
+# Widen data for final pre-processing before sending data to join with reflectance data.
+
+The way data is downloaded from the Water Quality Portal, each site*characteristic combination is downloaded independently so if sediment and chlorophyll were measured on the same day at the same site, they will be recorded as separate records. Here we merge that data together in a single wide data frame so that reflectance values for these simultaneous samples will be the exact same and only pulled down once. 
+
+```{r setup}
+library(knitr)
+library(feather)
+library(googledrive)
+library(tidyverse)
+library(sf)
+library(lubridate)
+#library(scipiper)
+library(USAboundaries)
+library(data.table)
+#opts_knit$set(root.dir='../..')
+```
+
+
+## Read in full datasets from WQP and LAGOS
+
+```{r}
+
+wqp.lagos <- read_feather("D:/Dropbox/projects/TSS/output/wqp_lagos_usgs_unity.feather")
+
+#Read in wrs inventory with path row
+#This is the landsat visible path row data
+wrs.inv <- read_feather('D:/Dropbox/projects/TSS/output/site_inventory_path_row_v2.feather') %>%
+  arrange(SiteID)
+
+unq.inv <-  read_feather('D:/Dropbox/projects/TSS/output/unique_site_inventory_v2.feather') %>%
+  arrange(SiteID) %>%
+  filter(!is.na(source)) %>%
+  select(-lat, -long)
+  
+#Grab back source column (lagos or wqp)
+wrs.source.inv <- unq.inv %>%
+  #Remove the lagos tag in the id (this kept lagos and wqp separate for the gee pull)
+  # changes from inner to left join
+  inner_join(wrs.inv,by=c('SiteID')) %>%
+  mutate(SiteID=gsub('lagos-','',SiteID)) %>%
+  distinct(SiteID,source,PATH,ROW,lat,long, .keep_all = T)
+
+site.candidates <- wqp.lagos %>%
+  inner_join(wrs.source.inv,by=c('SiteID','source')) %>%
+  #add a date column
+  mutate(date=as.Date(date_unity)) 
+
+```
+
+
+
+#Read in cloudiness data
+```{r}
+
+#Read in data. 
+clouds <- map_df(list.files('D:/GoogleDrive/clouds',full.names = T),read_csv) %>%
+  mutate(Date = ymd(str_split_fixed(`system:index`,'_',5)[,5])) 
+data_file <- 'output/clouds.feather'
+#Write out cloud data as a feather
+write_feather(clouds, data_file)
+
+#Load in cloudy dataset which is called dat. 
+#cloud.raw <- read_feather('2_rsdata/out/clouds.feather')
+cloud.raw <- read_feather('D:/Dropbox/projects/TSS/output/clouds.feather')
+
+#Subset to only WRS path rows in the inventory data. 
+clouds <- cloud.raw %>%
+  filter(WRS_PATH %in% wrs.inv$PATH &
+           WRS_ROW %in% wrs.inv$ROW) %>%
+  mutate(sat = str_split_fixed(LANDSAT_ID,'_',5)[,1]) %>%
+  mutate(date=ymd(str_split_fixed(LANDSAT_ID,'_',6)[,4])) %>%
+  select(PATH=WRS_PATH,ROW=WRS_ROW,date,clouds=CLOUD_COVER,sat,time='SENSING_TIME',landsat_id=LANDSAT_ID) 
+#Convert sat into a numeric
+clouds$sat <- as.numeric(str_split_fixed(clouds$sat,'0',2)[,2])
+rm(cloud.raw)
+
+```
+
+
+
+```{r}
+# download.file('http://efele.net/maps/tz/world//world/tz_world_mp.zip', destfile = "D:/Dropbox/projects/riverTSS/2_rsdata/usa_tz.zip" , method = 'curl')
+ 
+#
+#unzip("D:/Dropbox/projects/riverTSS/2_rsdata/usa_tz.zip",  exdir ="D:/Dropbox/projects/riverTSS/2_rsdata/usa_tz" )
+
+tz_world <- st_read('D:/Dropbox/projects/riverTSS/2_rsdata/world/tz_world_mp.shp',
+                    stringsAsFactors=F)
+#Read in usa data
+usa = us_states()
+
+#Subset to USA only
+tz_usa <- tz_world[usa,]
+
+#Get site locations
+sites_tz <- site.candidates %>%
+  distinct(lat,long,SiteID,source, .keep_all=T) %>%
+  st_as_sf(.,coords=c('long','lat'),crs=4326) %>%
+  st_join(.,tz_usa,st_intersects)
+
+#Leftovers = sites with NA TZID that need to be joined again to nearest timezone
+tz_simple <- tz_usa %>%
+  st_transform(2163) %>%
+  st_simplify(.,dTolerance=10000)
+
+library(nngeo)
+## Use nearest neighbor to get the sites that are usually
+#in estuaries and therefore not directly in a tz polygon
+# which are clipped to land
+nearest_tz <- sites_tz %>%
+  filter(is.na(TZID)) %>%
+  st_transform(2163) %>%
+  select(-TZID) %>%
+  st_join(.,tz_simple,nngeo::st_nn,k=1,maxdist=100000) %>%
+  st_transform(4326)%>%
+  as.data.frame() %>%
+  select(-geometry)
+
+#Stack these tz_identified datasets as non-sf objects
+full_tz <- sites_tz %>%
+  filter(!is.na(TZID)) %>%
+  as.data.frame() %>%
+  select(-geometry) %>%
+  bind_rows(.,nearest_tz) %>%
+  distinct(SiteID, .keep_all = T)
+
+#Force actual UTC timezone into the data
+site.candidates.utc <- inner_join(site.candidates,full_tz %>%
+                               select(SiteID,TZID),by='SiteID') %>%
+  mutate(date_unity = ifelse(date_only ==TRUE,
+                             date_unity + hours(12),
+                             date_unity) %>%
+           as.POSIXct(.,origin='1970-01-01 00:00:00',tz='UTC')) %>%
+  mutate(TZID = ifelse(source == "WQP" & date_only ==F, 'UTC', TZID)) %>%
+  mutate(date_utc = force_tzs(date_unity,TZID,tzone_out='UTC'))
+
+rm(full_tz,site.candidates,tz_simple,tz_world,wrs.inv)
+
+# WQP already in UTC, keep TZ utc
+# USGS in local time, correct TZ,
+# lagos in noon local time, convert ot utc
+# if else(date_only ==false, keep utc, keep local time)
+
+```
+
+
+## Join WQ data to WRS data by date and path row. 
+
+Here we join the WQP data to the cloud dataset. We do this for same day observations, but we also shoulder the *in situ* data by one day. Previous work has shown that within about a day, mostly in lakes, reflectance information can still be predictive of water quality. Users can later decide to not use these shoulder dates. 
+
+This is a major decisison if you are working in estuaries and in the dataset you should consider joining data closer to the exact hour when landsat passed overhead. `date_unity` will preserve this time information
+
+On dates where in situ measurements were made both the day of an overpass and the days after or before, we simply keep the days with same day observations and throw away the shoulder days. 
+
+```{r}
+#Same date join
+
+wqp.pull.same <- inner_join(site.candidates.utc,clouds,by=c('PATH','ROW','date')) %>%
+  mutate(timediff=date_utc-time) %>% 
+  data.table::data.table(.) %>%
+  .[,.SD[timediff==min(timediff)],keyby=list(SiteID,date)]
+
+#Shoulder the data by 1 day and make sure that sites where sequential samples occur only 
+#keep the same day sampling
+wqp.pull.plus1 <- site.candidates.utc %>%
+  mutate(date = date + 1) %>%
+  anti_join(wqp.pull.same, by=c('SiteID','date')) %>%
+  inner_join(clouds,by=c('PATH','ROW','date')) %>%
+  mutate(timediff=date_utc-time) %>%
+  data.table::data.table(.) %>%
+  .[,.SD[timediff==min(timediff)],keyby=list(SiteID,date)]
+
+#Shoulder the data by -1 day
+wqp.pull.minus1 <- site.candidates.utc %>%
+  mutate(date=date-1) %>%
+  anti_join(wqp.pull.same, by=c('SiteID','date')) %>%
+  inner_join(clouds,by=c('PATH','ROW','date')) %>%
+  mutate(timediff=date_utc-time) %>%
+  data.table::data.table(.) %>%
+  .[,.SD[timediff==min(timediff)],keyby=list(SiteID,date)]
+
+#Bind all this data together
+wqp.pull <- bind_rows(wqp.pull.same,wqp.pull.plus1,wqp.pull.minus1)
+
+#write_feather(wqp.pull, "D:/Dropbox/projects/riverTSS/2_rsdata/out/wide_pull_v3.feather")
+
+
+```
+
