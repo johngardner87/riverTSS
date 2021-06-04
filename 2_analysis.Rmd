@@ -1,0 +1,1334 @@
+---
+title: "1_summary"
+author: "John Gardner"
+date: "November 25, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(plotly)
+library(tidyverse)
+library(feather)
+library(viridis)
+library(sf)
+library(rgdal)
+library(maps)
+library(magrittr)
+library(purrr)
+library(data.table)
+library(tmap)
+library(ggthemes)
+library(dplyr)
+library(ggplot2)
+library(mapview)
+library(dtplyr)
+library(foreign)
+knitr::opts_chunk$set(echo = F)
+```
+
+
+```{r load}
+
+sr_tss <- read_feather("D:/Dropbox/projects/riverTSS/out/RiverSed_USA_V1.0.feather")
+
+flowline <- st_read("D:/GIS/river_networks/nhdplusv2_modified_v1.0.shp") 
+sr_constants_ID <- read_csv( "D:/Dropbox/projects/rivercolor/out/sr_conus_constants.csv") %>%
+  inner_join(flowline %>%
+               st_set_geometry(NULL) %>%
+               as_tibble() %>%
+               mutate(type = as.factor(ifelse(is.na(SurfAre) ,"Stream", "Lake"))) %>%
+               select(ID, Pthlngt, TtDASKM,type, COMID, StrmOrd, LvlPtID, LvlPthI, TermnlP,MINELEVS, QE_MA,WBAREAC,GNIS_NA) %>%
+               rename(TotDASqKM = TtDASKM), by="ID")
+
+```
+
+
+
+```{r sum, echo=FALSE}
+
+# long-term summary
+sr_sum <- sr_tss %>%
+  group_by(ID) %>%
+  mutate(unique_years = length(unique(year))) %>%
+  dplyr::filter(count > 50 & unique_years >15) %>%
+  dplyr::summarise_at(vars(tss), list(~median(.), ~mean(.), ~sd(.))) %>%
+  left_join(sr_constants_ID, by="ID")
+
+# annual summary
+tss_sum_year <- sr_tss %>%
+  dplyr::select(ID, year, tss) %>%
+  dplyr::group_by(ID, year) %>%
+  dplyr::summarise(tss_median=median(tss, na.rm=T),
+                   tss_mean=mean(tss, na.rm=T), 
+                   tss_sd=sd(tss, na.rm=T),
+                   tss_max= max(tss, na.rm=T),
+                   tss_min=min(tss, na.rm=T),
+                   tss_c99=quantile(tss, probs = 0.99, na.rm=T),
+                   tss_c90=quantile(tss, probs = 0.9, na.rm=T),
+                   tss_c75=quantile(tss, probs = 0.75, na.rm=T),
+                   tss_c25=quantile(tss, probs = 0.25, na.rm=T),
+                   tss_c10=quantile(tss, probs = 0.1, na.rm=T),
+                   count_year = n()) %>%
+  ungroup()
+
+# monthly summary
+tss_sum_month <- sr_tss %>%
+  #filter(ID %in% 1:3) %>%
+  lazy_dt() %>%
+  dplyr::select(ID, month, tss) %>%
+  dplyr::group_by(ID, month) %>%
+  dplyr::summarise(tss_median=median(tss, na.rm=T),
+                   tss_mean=mean(tss, na.rm=T), 
+                   tss_sd=sd(tss, na.rm=T),
+                   tss_max= max(tss, na.rm=T),
+                   tss_min=min(tss, na.rm=T),
+                   tss_c99=quantile(tss, probs = 0.99, na.rm=T),
+                   tss_c90=quantile(tss, probs = 0.9, na.rm=T),
+                   tss_c75=quantile(tss, probs = 0.75, na.rm=T),
+                   tss_c25=quantile(tss, probs = 0.25, na.rm=T),
+                   tss_c10=quantile(tss, probs = 0.1, na.rm=T),
+                   count_month = n()) %>%
+  as.data.table()
+
+# get counts per season per year
+sum_year_season <- sr_tss %>%
+  lazy_dt() %>%
+  dplyr::select(ID, date, year, season) %>%
+  dplyr::group_by(ID, year, season) %>%
+  summarise(count_year_season = n()) %>%
+  as.data.table()
+
+s_count <- sum_year_season %>% 
+  as.data.frame() %>%
+  dplyr::select(ID, year, season, count_year_season) %>%
+  spread(value = count_year_season, key=season) %>%
+  cbind(rowSums(is.na(.[, 3:6]))) %>%
+  rename(count_na_season = 7)
+
+### write data
+#write_feather(sr_sum, "out/tss_ID_sum_v1.feather")
+#write_csv(sr_sum, "D:/Dropbox/projects/riverTSS/out/tss_ID_sum_v1.csv")
+#write_feather(tss_sum_year, "D:/Dropbox/projects/riverTSS/out/tss_sum_ID_year_v1.feather")
+#write_feather(tss_sum_month, "D:/Dropbox/projects/riverTSS/out/tss_sum_ID_month_v1.feather")
+#write_feather(sum_year_season, "D:/Dropbox/projects/riverTSS/out/sum_year_season_v1.feather")
+#write_feather(s_count, "D:/Dropbox/projects/riverTSS/out/count_year_season_v1.feather")
+
+```
+
+
+```{r reach_tss_trends}
+
+flag_reaches <- read_csv( "D:/Dropbox/projects/riverTSS/out/flagged_reaches.csv")
+
+# filter to data that has at least 1 sample in 2 or more seasons, >= 5 per  year,  >15  years
+nested_tss_yr <- tss_sum_year %>%
+  left_join(s_count, by = c("ID", "year")) %>%
+  left_join(sr_constants_ID %>%
+              dplyr::select(ID, n_years), 
+            by="ID") %>%
+  dplyr::filter(count_year > 4, 
+                count_na_season < 3,
+                n_years > 10) %>%
+  group_by(ID) %>%
+  mutate(year_count = n()) %>%
+  dplyr::filter(year_count > 14) %>%
+  dplyr::filter(year <2019) %>%
+  nest()
+
+tss_sum_year %>%
+  left_join(s_count, by = c("ID", "year")) %>%
+  left_join(sr_constants_ID %>%
+              dplyr::select(ID, n_years, count), 
+            by="ID") %>%
+  dplyr::filter(count_year > 4, 
+                count_na_season < 3,
+                n_years > 10) %>%
+  group_by(ID) %>%
+  mutate(year_count = n()) %>%
+  dplyr::filter(year_count > 14) %>%
+  dplyr::filter(year <2019) %>%
+  ungroup() %>%
+  summarise(max= max(year_count, na.rm = T), min=min(year_count, na.rm=T), mean= mean(year_count, na.rm=T))
+
+# use mann kendall trend test
+trends_tss_annual <- nested_tss_yr %>%
+  mutate(mean = map2(data, "tss_mean", mk_name)) %>%
+  mutate(sd = map2(data, "tss_sd", mk_name)) %>%
+  mutate(median = map2(data, "tss_median", mk_name)) %>%
+  unnest(mean) %>%
+  unnest(median) %>%
+  unnest(sd) %>%
+  dplyr::select(-data) %>%
+  mutate(trend_mean = ifelse(p_tss_mean < 0.1 & tau_tss_mean > 0, "increasing", NA),
+         trend_mean = ifelse(p_tss_mean < 0.1 & tau_tss_mean < 0, "decreasing", trend_mean)) %>%
+  mutate(trend_median = ifelse(p_tss_median < 0.1 & tau_tss_median > 0, "increasing", NA),
+         trend_median = ifelse(p_tss_median  < 0.1 & tau_tss_median  < 0, "decreasing", trend_median )) %>%
+  mutate(trend_sd = ifelse(p_tss_sd < 0.1 & tau_tss_sd > 0, "increasing", NA),
+         trend_sd = ifelse(p_tss_sd < 0.1 & tau_tss_sd < 0, "decreasing", trend_sd)) %>%
+  mutate(trend_mean_05 = ifelse(p_tss_mean < 0.05 & tau_tss_mean > 0, "increasing", NA),
+         trend_mean_05 = ifelse(p_tss_mean < 0.05 & tau_tss_mean < 0, "decreasing", trend_mean_05)) %>%
+  mutate(trend_median_05 = ifelse(p_tss_median < 0.05 & tau_tss_median > 0, "increasing", NA),
+         trend_median_05 = ifelse(p_tss_median  < 0.05 & tau_tss_median  < 0, "decreasing", trend_median_05 )) %>%
+  mutate(trend_sd_05 = ifelse(p_tss_sd < 0.05 & tau_tss_sd > 0, "increasing", NA),
+         trend_sd_05 = ifelse(p_tss_sd < 0.05 & tau_tss_sd < 0, "decreasing", trend_sd_05)) %>%
+  ungroup()
+
+# calculate % of reaches with trends
+trends_tss_annual %>%
+  filter(!ID %in% flag_reaches$ID) %>%
+  group_by(trend_median_05) %>%
+  summarise(n=n()) %>%
+  mutate(total = sum(n), p = n/total) 
+
+tss_change <- trends_tss_annual %>%
+  filter(trend_median_05=="decreasing") %>%
+  left_join(tss_sum %>%
+              dplyr::select(ID, mean, median, sd), by="ID") %>%
+  mutate(sen = abs(sen_tss_median)) %>%
+  mutate(relative_change = ((sen)/median)*100) %>%
+  filter(!is.na(median) & !is.na(sen)) %>%
+  mutate(p_diff = (abs(median - (median-sen))/((median + (median-sen))/2))*100) 
+
+# to calculate the % change over 34 years
+# range and median % change
+(1 - min(tss_change$relative_change)/100)^34-1
+(1 - max(tss_change$relative_change)/100)^34-1
+(1 - median(tss_change$relative_change)/100)^34-1
+
+### write data
+#write_feather(trends_tss_annual, "D:/Dropbox/projects/riverTSS/out/tss_annaul_trends_v1.feather")
+  
+```
+
+
+```{r pathsum}
+
+### make list of mainstem rivers and their attributes
+
+# make conversion table between modified and unmodified NHD
+COMID_ID <- read_csv("D:/Dropbox/projects/riverTSS/out/COMID_ID.csv")
+
+# load table of nhd COMID with HUC12 ID
+# https://www.sciencebase.gov/catalog/item/57eaa10fe4b09082500db04e
+nhd_huc <- read.dbf('D:/GIS/river_networks/HUC12_COMID/HUC12_PU_COMIDs_CONUS.dbf') %>%
+  left_join(COMID_ID, by="COMID") %>%
+  mutate(HUC02 = substr(HUC12, 1, 2),
+         HUC04 = substr(HUC12, 1, 4),
+         HUC06 = substr(HUC12, 1, 6),
+         HUC08 = substr(HUC12, 1, 8),
+         HUC10 = substr(HUC12, 1, 10)
+         )
+  
+## sword join from Gardner et al. 2020
+#sword_nhd <- read_feather("D:/Dropbox/projects/riverTSS/out/nhd_sword_width.feather#") %>%
+#  dplyr::select(ID, width, width_var)
+
+# make data of mainstem river names, LevelPaths, and info that are > 100 km long
+path_sum <- nhd_huc %>%
+  filter(!is.na(ID)) %>%
+  left_join(flowline_full %>%
+              st_set_geometry(NULL) %>%
+              select(-ID), by="COMID") %>%
+  ## can also filter by width
+  #left_join(sword_nhd, by="ID") %>%
+  #filter(width >60) %>%
+  group_by(LevelPathI) %>%
+  summarise(length_lvl= sum(LENGTHKM), n_reaches = length(unique(ID))) %>%
+  ungroup() %>%
+  left_join(inner_join(flowline_full %>%
+              st_set_geometry(NULL) %>%
+              group_by(LevelPathI) %>%
+              summarise(max_area = max(TotDASqKM, na.rm=T),
+                       min_area = min(TotDASqKM, na.rm=T),
+                       max_path = max(Pathlength, na.rm=T),
+                       min_path= min(Pathlength, na.rm=T)) %>%
+              ungroup() %>%
+              group_by(LevelPathI) %>%
+              filter(max_area ==max(max_area)) %>%
+              ungroup(),
+              flowline_full %>%
+                st_set_geometry(NULL) %>%
+                #filter(Tidal==0) %>%
+                filter(!is.na(GNIS_NA)) %>%
+                group_by(LevelPathI) %>%
+                summarise(GNIS_NA = GNIS_NA[TotDASqKM==max(TotDASqKM, na.rm=T)][1]), by="LevelPathI"), by="LevelPathI") %>%
+ filter(length_lvl >100) %>%
+  mutate(Name = case_when(
+    GNIS_NA == "Schooner Creek"~  "Great Pee Dee River",
+    GNIS_NA == "New York Slough" ~ "San Joaquin River",
+    GNIS_NA == "Freshwater Slough" ~ "Skagit River",
+    GNIS_NA =="Trout Creek" ~ "St. John's River",
+    GNIS_NA == "Dead River" ~ "Escambia River",
+    GNIS_NA == "Lower Atchafalaya River" ~ "Atchafalaya-Red River",
+    TRUE ~ as.character(GNIS_NA)))
+  
+
+# fix this to find NA Names
+path_sum_all <- nhd_huc %>%
+  filter(!is.na(ID)) %>%
+  left_join(flowline_full %>%
+              st_set_geometry(NULL) %>%
+              select(-ID), by="COMID") %>%
+  ## can also filter be width
+  #left_join(sword_nhd, by="ID") %>%
+  #filter(width >60) %>%
+  group_by(LevelPathI) %>%
+  summarise(length_lvl= sum(LENGTHKM), n_reaches = length(unique(ID))) %>%
+  ungroup() %>%
+  left_join(inner_join(flowline_full %>%
+              st_set_geometry(NULL) %>%
+              group_by(LevelPathI) %>%
+              summarise(max_area = max(TotDASqKM, na.rm=T),
+                       min_area = min(TotDASqKM, na.rm=T),
+                       max_path = max(Pathlength, na.rm=T),
+                       min_path= min(Pathlength, na.rm=T)) %>%
+              ungroup() %>%
+              group_by(LevelPathI) %>%
+              filter(max_area ==max(max_area)) %>%
+              ungroup(),
+              flowline_full %>%
+                st_set_geometry(NULL) %>%
+                #filter(Tidal==0) %>%
+                filter(!is.na(GNIS_NA)) %>%
+                group_by(LevelPathI) %>%
+                summarise(GNIS_NA = GNIS_NA[TotDASqKM==max(TotDASqKM, na.rm=T)][1]), by="LevelPathI"), by="LevelPathI") %>%
+  mutate(Name = case_when(
+    GNIS_NA == "Schooner Creek"~  "Great Pee Dee River",
+    GNIS_NA == "New York Slough" ~ "San Joaquin River",
+    GNIS_NA == "Freshwater Slough" ~ "Skagit River",
+    GNIS_NA =="Trout Creek" ~ "St. John's River",
+    GNIS_NA == "Dead River" ~ "Escambia River",
+    GNIS_NA == "Lower Atchafalaya River" ~ "Atchafalaya-Red River",
+    TRUE ~ as.character(GNIS_NA)))
+    
+path_sum <-read_csv( "D:/Dropbox/projects/riverTSS/out/levelpath_summary_100km_v1.csv")
+
+#write_csv(path_sum, "D:/Dropbox/projects/riverTSS/out/levelpath_summary_100km_v1.csv")
+
+#write_csv(path_sum_all, "D:/Dropbox/projects/riverTSS/out/levelpath_summary_all_v1.csv")
+```
+
+
+```{r river_tss_trends}
+
+sites_stack <- readNWISsite(unique(nested_flow_trends$site_no)) %>%
+  mutate(DRAIN_SQKM = drain_area_va * 2.58999 ) %>%
+  select(site_no, DRAIN_SQKM)
+
+tss_sum_year_join <- tss_sum_year %>%
+  left_join(sr_constants_ID %>%
+              dplyr::select(ID:LT05_frac), by="ID") %>%
+    left_join(flowline %>%
+              st_set_geometry(NULL) %>%
+              dplyr::select(ID:ELEVFIX, toCOMID, LakFrct, SurfAre,QE_MA,VE_MA, WBArTyp), by="ID") %>%
+      filter(LvlPthI %in% path_sum$LevelPathI)  %>%
+  left_join(nhd_huc %>%
+              dplyr::select(COMID, HUC02, HUC04, HUC06, HUC08, HUC10, HUC12, TOHUC), by= "COMID") %>%
+  mutate(type  = ifelse(WBArTyp =="Lake", "Lake", "River")) %>%
+  #left_join(sword_nhd, by="ID") %>%
+  left_join(path_sum, by=c("LvlPthI" ="LevelPathI")) %>%
+  # filter to years that have 25% of reaches
+  #filter(width > 60) %>%
+  filter(count_year >4) %>%
+  group_by(LvlPthI, year) %>%
+  mutate(n_reaches_year = n()) %>%
+  filter(n_reaches_year > n_reaches * 0.49) %>%
+  ungroup() %>%
+  filter(year > 1984 & year <2019)
+
+tss_profile_trends <- tss_sum_year_join %>%
+  filter(!ID %in% flag_reaches$ID) %>%
+  group_by(LvlPthI, year) %>%
+  summarise(tss_mean_prof = mean(tss_mean, na.rm=T),
+            tss_med_prof = median(tss_median, na.rm=T),
+            tss_mm_prof = median(tss_mean, na.rm=T),
+            tss_sd_mean_prof = sd(tss_mean, na.rm=T),
+            tss_sd_median = sd(tss_median, na.rm=T)) %>%
+  ungroup() %>%
+  filter(!is.na(tss_mean_prof)) %>%
+  group_by(LvlPthI) %>%
+  mutate(n_tss = n()) %>%
+  filter(n_tss >=15) %>%
+  nest() %>%
+  mutate(mean = map2(data, "tss_mean_prof", mk_name)) %>%
+  mutate(med = map2(data, "tss_mm_prof", mk_name)) %>%
+  unnest(mean) %>%
+  unnest(med) %>%
+  select(-data) %>%
+  mutate(mean_prof_trend = ifelse(p_tss_mean_prof < 0.05 & tau_tss_mean_prof > 0, "increasing", NA),
+         mean_prof_trend= ifelse(p_tss_mean_prof < 0.05 & tau_tss_mean_prof < 0, "decreasing", mean_prof_trend)) %>%
+  ungroup() %>%
+    mutate(mm_prof_trend = ifelse(p_tss_mm_prof < 0.05 & tau_tss_mm_prof > 0, "increasing", NA),
+         mm_prof_trend= ifelse(p_tss_mm_prof < 0.05 & tau_tss_mm_prof < 0, "decreasing", mm_prof_trend)) %>%
+  ungroup()
+
+tss_profile_trends %>%
+  group_by(mean_prof_trend) %>%
+  summarise(n=n()) %>%
+  mutate(p = n/sum(n))
+
+mapview(flowline %>% inner_join(tss_profile_trends, by="LvlPthI"), zcol="mean_prof_trend")
+
+
+#write_feather(tss_sum_year_join, "D:/Dropbox/projects/riverTSS/out/tss_sum_year_join_v1.feather")
+
+#write_csv(tss_profile_trends, "D:/Dropbox/projects/riverTSS/out/tss_profile_trends_v1.csv")
+
+```
+
+
+
+
+```{r reach_flow_trends}
+
+# flow trend analysis
+
+huc4<- st_read("D:/GIS/WBD/WBD_HUC4.shp") %>%
+    mutate(HUC2 = substr(HUC4, 1, 2)) %>%
+    filter(!HUC2 %in% c("19", "20", "21", "22"))
+
+flow_stack_sum_yr <- read_feather("D:/Dropbox/projects/riverTSS/out/flow_stack_sum_cal_yr.feather")
+
+flow_site_info <- flow_stack_sum_yr %>% 
+  group_by(site_no) %>%
+  mutate(n_years = n()) %>%
+  ungroup() %>%
+  distinct(site_no, .keep_all = T) %>%
+  select(site_no, n_years, source, COMID, station, begin_date, alt_va, coord_datum,
+         lat, long, huc8, n_site)
+
+nested_flow <- flow_stack_sum_yr %>%
+  group_by(site_no) %>%
+  mutate(n_years = n()) %>%
+  filter(n_years > 14) %>%
+  nest() %>%
+  mutate(mean = map2(data, "mean_flow", mk_name)) %>%
+  mutate(sd = map2(data, "sd_flow", mk_name)) %>%
+  mutate(median = map2(data, "median_flow", mk_name)) %>%
+  mutate(Q10 = map2(data, "Q10_flow", mk_name)) %>%
+  mutate(max = map2(data, "max_flow", mk_name)) %>%
+  unnest(mean) %>%
+  unnest(median) %>%
+  unnest(sd) %>%
+  unnest(Q10) %>%
+  unnest(max) %>%
+  dplyr::select(-data) %>%
+  mutate(trend_mean = ifelse(p_mean_flow < 0.1 & tau_mean_flow > 0, "increasing", NA),
+         trend_mean = ifelse(p_mean_flow < 0.1 & tau_mean_flow < 0, "decreasing", trend_mean)) %>%
+  mutate(trend_median = ifelse(p_median_flow < 0.1 & tau_median_flow > 0, "increasing", NA),
+         trend_median = ifelse(p_median_flow  < 0.1 & tau_median_flow  < 0, "decreasing", trend_median )) %>%
+  mutate(trend_sd = ifelse(p_sd_flow < 0.1 & tau_sd_flow > 0, "increasing", NA),
+         trend_sd = ifelse(p_sd_flow < 0.1 & tau_sd_flow < 0, "decreasing", trend_sd)) %>%
+  mutate(trend_Q10 = ifelse(p_Q10_flow < 0.1 & tau_Q10_flow > 0, "increasing", NA),
+         trend_Q10 = ifelse(p_Q10_flow < 0.1 & tau_Q10_flow < 0, "decreasing", trend_Q10)) %>% 
+  mutate(trend_max = ifelse(p_max_flow < 0.1 & tau_max_flow > 0, "increasing", NA),
+         trend_max = ifelse(p_max_flow < 0.1 & tau_max_flow < 0, "decreasing", trend_max)) %>%
+  ungroup()
+
+
+nested_flow_trends <- nested_flow %>%
+  inner_join(flow_site_info, by="site_no") %>%
+  ungroup() %>%
+  separate(huc8, 4, into=c("huc4", "junk"), remove=F) %>%
+  dplyr::select(-junk) %>%
+    mutate(trend_mean_05 = ifelse(p_mean_flow < 0.05 & tau_mean_flow > 0, "increasing", NA),
+         trend_mean_05 = ifelse(p_mean_flow < 0.05 & tau_mean_flow < 0, "decreasing", trend_mean_05)) %>%
+  mutate(trend_median_05 = ifelse(p_median_flow < 0.05 & tau_median_flow > 0, "increasing", NA),
+         trend_median_05 = ifelse(p_median_flow  < 0.05 & tau_median_flow  < 0, "decreasing", trend_median_05 )) %>%
+  mutate(trend_sd_05 = ifelse(p_sd_flow < 0.05 & tau_sd_flow > 0, "increasing", NA),
+         trend_sd_05 = ifelse(p_sd_flow < 0.05 & tau_sd_flow < 0, "decreasing", trend_sd_05)) %>%
+  mutate(trend_Q10_05 = ifelse(p_Q10_flow < 0.05 & tau_Q10_flow > 0, "increasing", NA),
+         trend_Q10_05 = ifelse(p_Q10_flow < 0.05 & tau_Q10_flow < 0, "decreasing", trend_Q10_05)) %>% 
+  mutate(trend_max_05 = ifelse(p_max_flow < 0.05 & tau_max_flow > 0, "increasing", NA),
+         trend_max_05 = ifelse(p_max_flow < 0.05 & tau_max_flow < 0, "decreasing", trend_max_05)) %>%
+  arrange(huc8, site_no)
+
+
+nested_flow_trends %>%
+  group_by(trend_mean_05) %>%
+  summarise(n=n()) %>%
+  mutate(sum= sum(n), perc = n/sum)
+
+nested_flow_trends %>%
+  group_by(trend_mean_05) %>%
+  summarise(n=n()) %>%
+  mutate(sum= sum(n), perc = n/sum)
+
+#check location of flow trends. where are dec/inc? IN larger rivers?
+#nested_flow_trends_sf<- nested_flow_trends %>%
+#  st_as_sf(coords = c("long", "lat"), crs=4326)
+#mapview(nested_flow_trends_sf,   zcol="trend_median_05")
+
+#write_feather(nested_flow_trends, "D:/Dropbox/projects/riverTSS/out/flow_annaul_trends_v1.feather")
+
+#write_feather(flow_site_info, "D:/Dropbox/projects/riverTSS/out/flow_stack_site_info_v1.feather")
+
+```
+
+
+
+```{r river_Q_tss}
+
+Q_major <- flow_stack_sum_yr %>%
+  left_join(flowline_full %>%
+              st_set_geometry(NULL)
+              , by="COMID") %>%
+  filter(LevelPathI %in% tss_sum_year_join$LvlPthI) %>%
+  filter(Tidal==0) %>%
+  select(site_no:long, LevelPathI, TotDASqKM) %>%
+  group_by(LevelPathI) %>%
+  filter(TotDASqKM == max(TotDASqKM, na.rm=T)) %>%
+  ungroup() %>%
+  filter(!site_no %in% c("11406930", 	
+"01646502")) %>%
+  left_join(sites_stack, by="site_no") %>%
+  group_by(site_no) %>%
+  mutate(med_flow_rank = percent_rank(median_flow),
+         mean_flow_rank = percent_rank(mean_flow),
+         sd_flow_rank = percent_rank(sd_flow)) %>%
+  ungroup() 
+
+mapview(flowline %>%
+          filter(LvlPthI %in% path_sum$LevelPathI))
+
+annual_prof_sum <- tss_sum_year_join %>%
+  filter(!ID %in% flag_reaches$ID) %>%
+  group_by(LvlPthI, year) %>%
+  summarise(tss_mean_prof = mean(tss_mean, na.rm=T),
+            tss_med_prof = median(tss_median, na.rm=T),
+            tss_mm_prof = median(tss_mean, na.rm=T),
+            tss_sd_mean_prof = sd(tss_mean, na.rm=T),
+            tss_sd_median = sd(tss_median, na.rm=T)) %>%
+  ungroup() %>%
+ # filter(!is.na(tss_mean_prof)) %>%
+  inner_join(Q_major, by=c("LvlPthI" ="LevelPathI", "year")) %>%
+  left_join(path_sum %>%
+              select(LevelPathI, Name), by=c("LvlPthI" ="LevelPathI"))
+
+
+annual_prof_log <- annual_prof_sum %>%
+  filter(!is.na(mean_flow) & !is.na(tss_mean_prof)) %>%
+  group_by(LvlPthI) %>%
+  mutate(n = n()) %>%
+  filter(n >9) %>%
+  nest() %>%
+
+  mutate(log =purrr::map(data, logf))  %>%
+
+  unnest(log) %>%
+  select(-data) %>%
+  mutate(sig = ifelse(pvalue < 0.05, "log", NA))
+  
+annual_prof_lm <- annual_prof_sum %>%
+  filter(!is.na(mean_flow) & !is.na(tss_mean_prof)) %>%
+  group_by(LvlPthI) %>%
+  mutate(n = n()) %>%
+  filter(n >9) %>%
+  nest() %>%
+  mutate(log =purrr::map(data, linearf))  %>%
+  unnest(log) %>%
+  select(-data) %>%
+  mutate(sig = ifelse(pvalue < 0.05, "linear", NA))
+
+annual_prof_exp <- annual_prof_sum %>%
+  filter(!is.na(mean_flow) & !is.na(tss_mean_prof)) %>%
+  group_by(LvlPthI) %>%
+  mutate(n = n()) %>%
+  filter(n >9) %>%
+  nest() %>%
+  mutate(log =purrr::map(data, expf))  %>%
+  unnest(log) %>%
+  select(-data) %>%
+  mutate(sig = ifelse(pvalue < 0.05, "exponential", NA))
+
+annual_prof_pow <- annual_prof_sum %>%
+  filter(!is.na(mean_flow) & !is.na(tss_mean_prof)) %>%
+  group_by(LvlPthI) %>%
+  mutate(n = n()) %>%
+  filter(n >9) %>%
+  nest() %>%
+  mutate(log =purrr::map(data, powerf))  %>%
+  unnest(log) %>%
+  select(-data) %>%
+  mutate(sig = ifelse(pvalue < 0.05, "power", NA))
+
+annual_rating <- rbind(annual_prof_log, annual_prof_exp, annual_prof_lm, annual_prof_pow)  %>%
+  group_by(LvlPthI) %>%
+  filter(!is.na(sig)) %>%
+  filter(r2 == max(r2)) %>%
+  ungroup() 
+
+```
+
+```{r spatial_tss}
+
+tss_sum <- sr_sum %>%
+  left_join(path_sum %>%
+              select(-GNIS_NA), by=c("LvlPthI"="LevelPathI")) %>%
+ # filter(LvlPthI %in% tss_profile_trends$LvlPthI) %>%
+  filter(!ID %in% flag_reaches$ID) %>%
+  filter(count >75)
+
+
+spatial_trend_lin <- tss_sum %>%
+  filter(length_lvl >100) %>%
+  filter(!is.na(mean), !is.na(Pthlngt)) %>%
+  group_by(LvlPthI) %>%
+  mutate(n_reaches = n()) %>%
+  filter(n_reaches >4) %>%
+  nest() %>%
+  mutate(m = purrr::map(data, lin_sp)) %>%
+  unnest(m) %>%
+  select(-data) %>%
+  ungroup() 
+
+spatial_trend_exp <- tss_sum %>%
+  filter(length_lvl >100) %>%
+  filter(!is.na(mean), !is.na(Pthlngt)) %>%
+  group_by(LvlPthI) %>%
+  mutate(n_reaches = n()) %>%
+  filter(n_reaches >4) %>%
+  nest() %>%
+  mutate(m = purrr::map(data, exp_sp)) %>%
+  unnest(m) %>%
+  select(-data) %>%
+  ungroup() 
+  
+spatial_trend_pow <- tss_sum %>%
+  filter(length_lvl >100) %>%
+  filter(!is.na(mean), !is.na(Pthlngt), Pthlngt >0) %>%
+  group_by(LvlPthI) %>%
+  mutate(n_reaches = n()) %>%
+  filter(n_reaches >4) %>%
+  nest() %>%
+  mutate(m = purrr::map(data, pow_sp)) %>%
+  unnest(m) %>%
+  select(-data) %>%
+  ungroup() 
+
+spatial_trend_log <- tss_sum %>%
+  filter(length_lvl >100) %>%
+  filter(!is.na(mean), !is.na(Pthlngt), Pthlngt >0) %>%
+  group_by(LvlPthI) %>%
+  mutate(n_reaches = n()) %>%
+  filter(n_reaches >4) %>%
+  nest() %>%
+  mutate(m = purrr::map(data, log_sp)) %>%
+  unnest(m) %>%
+  select(-data) %>%
+  ungroup() 
+
+
+spatial_trend_all <- rbind(spatial_trend_log, spatial_trend_exp, spatial_trend_lin, spatial_trend_pow)  %>%
+  group_by(LvlPthI) %>%
+  filter(pvalue < 0.05) %>%
+  filter(r2 == max(r2)) %>%
+  ungroup() %>%
+  mutate(direction = ifelse(slope <0,"increasing", "decreasing" )) 
+
+spatial_trend_all <- bind_rows(spatial_trend_all,
+                               spatial_trend_lin %>% 
+  filter(!LvlPthI %in% spatial_trend_all$LvlPthI) %>%
+  dplyr::select(LvlPthI) %>%
+  mutate(direction = "none")) %>%
+  mutate(linearity = ifelse(fit=="linear", "linear", "non-linear"))
+
+spatial_trend_all %>%
+  filter(LvlPthI %in% tss_profile_trends$LvlPthI ) %>%
+  group_by(direction) %>%
+  summarise(n=n()) %>%
+  mutate(p = n/ sum(n))
+
+spatial_trend_all %>%
+  filter(direction != "none") %>%
+  group_by( direction, linearity) %>%
+  summarise(n=n()) %>%
+  mutate(p = n/ sum(n))
+
+ggplot(tss_sum %>% left_join(spatial_trend_all, by="LvlPthI") %>% filter(fit=="power")) +
+  geom_line(aes(x=(Pthlngt), y=log10(mean), color=direction)) +
+  scale_x_reverse() +
+  facet_wrap(~LvlPthI, scales="free")
+
+mapview(flowline %>% inner_join(tss_spatial_trend, by="LvlPthI"), zcol="trend_sp")
+
+########################
+
+spatial_trend_MK <- tss_sum %>%
+  filter(length_lvl >100) %>%
+  filter(!is.na(mean), !is.na(Pthlngt), Pthlngt >0) %>%
+  group_by(LvlPthI) %>%
+  mutate(n_reaches = n()) %>%
+  filter(n_reaches >4) %>%
+  nest() %>%
+  mutate(m = purrr::map(data, MK_sp)) %>%
+  unnest(m) %>%
+  select(-data) %>%
+  ungroup() %>%
+  mutate(trend_sp = ifelse(p < 0.05 & sen > 0, "increasing", NA)) %>%
+  mutate(trend_sp = ifelse(p < 0.05 & sen < 0, "decreasing", trend_sp)) %>%
+  mutate(trend_sp = ifelse(is.na(trend_sp), "none", trend_sp))
+
+spatial_trend_MK %>%
+  filter(LvlPthI %in% tss_profile_trends$LvlPthI ) %>%
+  group_by(trend_sp) %>%
+  summarise(n=n()) %>%
+  mutate(p = n/ sum(n))
+
+##########################
+# dams
+
+dams_sf <- st_read("D:/Dropbox/projects/riverTSS/in/FINAL_NID_2018.shp")
+
+NID <- read_csv("D:/Dropbox/projects/riverTSS/in/NID2019.csv")
+
+dams <- suppressWarnings( dams_sf %>%
+                            st_set_geometry(NULL) %>%
+                            mutate(NIDID = as.character(NIDID)) %>%
+                            dplyr::select(NIDID, FlowLcomid, NID_STORAG) %>%
+  left_join(NID, by="NIDID") %>%
+  group_by(NIDID) %>%
+  filter(NID_HEIGHT == max(NID_HEIGHT, na.rm=T)| is.na(NID_HEIGHT)) %>%
+  ungroup() %>%
+  dplyr::distinct(NIDID, NID_STORAGE, NID_HEIGHT, .keep_all = TRUE) ) %>%
+  filter(!grepl("TR-|-TR|^TR|- TR|TR -|-OS|- OS|OS-|OS -|WTRSHD|WATERSHED|OFF|^UT|UNKNOWN|UNNAMED|DRAW|RUNOFF|ADJACENT|CREEK|BROOK|ARROYO|DRAIN|POND|RESERVOIR|BRANCH|BAYOU|UNT|SLOUGH|SPILLWAY|NODAWAY|TRIB|CREEK|OFFSTREAM|PUMPED|OUTLET|SWAMP|NONE|DIFFUSED| OS$|RUN$|CANAL$|CR$|GUT$", RIVER)) %>%
+  filter(!grepl("WASTEWATER|WASTE WATER|NUCLEAR|ASH POND|WATER RESERVOIR|TRIANGULAR|COOLING|DETENTION|DIKE|POND|WHEELER BROTHERS",  DAM_NAME)) #%>%
+ # filter(!is.na(RIVER))
+
+nabd <- st_read("D:/GIS/Dams/nabd_fish_barriers_2012.shp")  %>%
+  mutate_if(is.factor, as.character) %>%
+  st_set_geometry(NULL) %>%
+  mutate(source="nabd") %>%
+  mutate(COMID = ifelse(NIDID == "MT00025", 940060010, COMID))
+
+missing_dams <- dams %>%
+  filter(!NIDID %in% nabd$NIDID) %>%
+  dplyr::rename(COMID = FlowLcomid, Dam_name = DAM_NAME, NID_stor= NID_STORAGE, NID_height = NID_HEIGHT, Year_compl =YEAR_COMPLETED, Surf_area = SURFACE_AREA, River_NID=RIVER) %>%
+dplyr::select(NIDID, COMID, Dam_name, NID_stor,NID_STORAG, NID_height, Year_compl, Surf_area, River_NID) %>%
+  mutate(source = "NID")
+
+# if dam from dams or dam_sfm, and river name not same, remove
+nabd2 <- suppressWarnings(bind_rows(nabd, missing_dams) %>%
+  group_by(NIDID) %>%
+  filter(NID_height == max(NID_height, na.rm=T) | is.na(NID_height)) %>%
+  ungroup() %>%
+ dplyr::distinct(NIDID, NID_stor, NID_height, .keep_all = TRUE) %>%
+left_join(NID %>%
+            group_by(NIDID) %>%
+            filter(NID_HEIGHT == max(NID_HEIGHT, na.rm=T)| is.na(NID_HEIGHT)) %>%
+            ungroup() %>%
+            dplyr::distinct(NIDID, NID_STORAGE, NID_HEIGHT, .keep_all = TRUE) %>%
+            dplyr::select(NIDID, NID_HEIGHT, NID_STORAGE)
+, by="NIDID") %>%
+    mutate(HEIGHT = case_when(
+      NID_HEIGHT > NID_height ~ NID_HEIGHT,
+      NID_height > NID_HEIGHT ~ NID_height,
+      NID_height == NID_HEIGHT ~ NID_HEIGHT,
+      is.na(NID_HEIGHT) ~ NID_height,
+      is.na(NID_height) ~ NID_HEIGHT,
+    )) %>%
+    mutate(HEIGHT = ifelse(HEIGHT==0, NA, HEIGHT)) %>%
+    mutate(STORAGE = case_when(
+      NID_STORAGE > NID_stor ~ NID_STORAGE,
+      NID_stor > NID_STORAGE ~ NID_stor,
+      NID_STORAGE == NID_stor ~ NID_STORAGE,
+      is.na(NID_STORAGE) ~ NID_stor,
+      is.na(NID_stor) ~ NID_STORAGE,
+      is.na(NID_stor) & is.na(NID_STORAGE) ~ NID_STORAG
+    )) %>%
+    arrange(NIDID) ) %>%
+  filter(!is.na(River_NID) & source=="NID"|source=="nabd")
+
+nabd2 %>% filter(!is.na(Year_compl)) %>%
+  filter(Year_compl >=1984) %>%
+  summarise(n=n())
+
+dams_sub <- nabd2 %>% filter(COMID %in% flowline_full$COMID) %>% 
+  dplyr::select(Dam_name, River,River_NID, source, Year_compl, NIDID, COMID, NID_stor, NID_STORAGE, NID_STORAG, NID_height, NID_HEIGHT, HEIGHT, STORAGE) %>%
+  arrange(source,NIDID)  
+
+###
+nhd_all %>%
+  filter(LevelPathI %in% flowline_full$LevelPathI) %>%
+  st_set_geometry(NULL) %>%
+  summarise(sum = sum(LENGTHKM))
+  
+dam_per_river <-  nhd_all %>%
+  filter(LevelPathI %in% flowline_full$LevelPathI) %>%
+  st_set_geometry(NULL) %>%
+   left_join(nabd2, by="COMID") %>%
+  group_by(LevelPathI) %>%
+  summarise(n_dams = sum(!is.na(NIDID)),
+            total_storage = sum(STORAGE, na.rm=T),
+            median_storage = median(STORAGE, na.rm=T),
+            max_storage = max(STORAGE, na.rm=T),
+            median_height = median( HEIGHT, na.rm=T),
+            max_height = max(HEIGHT, na.rm=T)) %>%
+  ungroup() %>%
+  inner_join(flowline_full %>%
+               st_set_geometry(NULL) %>%
+               group_by(LevelPathI) %>%
+               summarise(mean_Q_cms = mean(QE_MA, na.rm=T) * 0.0283168,
+                         max_Q_cms = max(QE_MA, na.rm=T) * 0.0283168,
+                         max_Area = max(TotDASqKM, na.rm=T),
+                         min_path = min(Pathlength, na.rm=T),
+                         max_path = max(Pathlength, na.rm=T),
+                         mean_elev = mean(MINELEVS, na.rm=T) *0.01,
+                         min_elev = MINELEVS[Pathlength==min(Pathlength)] *0.01,
+                         max_elev = MINELEVS[Pathlength==max(Pathlength)] *0.01,
+                         length = sum(LENGTHKM, na.rm=T),
+                         length_tidal = sum(LENGTHKM[Tidal==1]),
+                         river_slope = ((max_elev - min_elev) /1000) / (max_path - min_path)
+  ),
+  by= "LevelPathI") %>%
+  ungroup() %>%
+  filter(river_slope >0, !is.na(river_slope)) %>%
+  mutate(perc_tidal = length_tidal/length) %>%
+  mutate(storage_total_mm = ((total_storage/810713.18210885)/max_Area)*10^6) %>%
+  mutate(storage_max_mm = ((max_storage/810713.18210885)/max_Area)*10^6) %>%
+  mutate(storage_med_mm = ((median_storage/810713.18210885)/max_Area)*10^6) %>%
+  mutate(storage_total_km3 = total_storage/810713.18210885) %>%
+  mutate(storage_max_km3 = max_storage/810713.18210885) %>%
+  mutate(storage_med_km3 = median_storage/810713.18210885) %>%
+  mutate(storage_km2 = (total_storage/810713.18210885)/length) %>%
+  mutate(D_density = n_dams/length)
+
+tss_dam_spatial <- spatial_trend_all %>%
+  inner_join(dam_per_river, by= c("LvlPthI"="LevelPathI"))  %>%
+  mutate(trend = ifelse(direction=="none", "decreasing", direction)) %>%
+  mutate(dams = ifelse(n_dams==0, "zero", ">1")) %>%
+  mutate(trend_linearity = paste(direction, linearity, sep="_")) %>%
+  mutate(power = river_slope * mean_Q_cms)
+
+ggplot(tss_dam_spatial)+
+  geom_point(aes(x=length, y=max_Area)) +
+  scale_y_log10()
+
+## filter out these levelpaths
+#tss_dam_spatial %>% filter(max_Area >50000 & length < 500)  %>% as.data.frame()
+  
+tss_dam_spatial %>%
+  group_by(dams) %>%
+  summarise(n=n()) %>%
+  mutate(p = n/(sum(n)))
+
+tss_dam_spatial %>%
+  group_by(trend) %>%
+  summarise(n=n()) %>%
+  mutate(p = n/(sum(n)))
+
+spatial_trend_all %>%
+  mutate(trend_sp = ifelse(trend_sp=="none", "decreasing", trend_sp)) %>%
+  inner_join(dam_per_river, by= c("LvlPthI"="LevelPathI")) %>%
+  ggplot() +
+  geom_density(aes(n_dams/length, fill=trend_sp), color="black", alpha=0.5) +
+  scale_x_log10()
+
+tss_dam_spatial %>%
+  group_by(trend) %>%
+  summarise(n=n(),
+            height_median_max=median(max_height, na.rm=T),
+            height_median=median(median_height, na.rm=T),
+            storage_median_med=median(storage_med_mm,na.rm = T),
+            storage_median_max=median(storage_max_mm,na.rm = T),
+            storage_median_total=median(storage_total_mm, na.rm=T),
+            storage_median_med_km3=median(storage_med_km3,na.rm = T),
+            storage_median_max_km3=median(storage_max_km3,na.rm = T),
+            storage_median_total_km3=median(storage_total_km3, na.rm=T),
+            density= median(D_density, na.rm=T))
+  
+kruskal.test(storage_total_mm ~ trend, data=tss_dam_spatial)
+kruskal.test(storage_med_mm ~ trend, data=tss_dam_spatial)
+kruskal.test(storage_total_km3 ~ trend, data=tss_dam_spatial)
+kruskal.test(storage_max_km3 ~ trend, data=tss_dam_spatial)
+kruskal.test(D_density ~ trend, data=tss_dam_spatial)
+kruskal.test(median_height ~ trend, data=tss_dam_spatial)
+kruskal.test(max_height ~ trend, data=tss_dam_spatial)
+kruskal.test(storage_km2 ~ trend, data=tss_dam_spatial)
+
+```
+
+
+```{r erosion}
+
+# soil erosion
+library(tigris)
+
+nri <- read_csv("D:/Dropbox/projects/riverTSS/in/NRI_erosion_county.csv") %>%
+  filter(!is.na(State))
+
+county <- tigris::counties(cb=T, class="sf") %>%
+  mutate(Fips= paste0(STATEFP, COUNTYFP, sep="")) %>%
+  filter(!STATEFP %in% c("02", "15" ,"66", "78", "72", "69", "60"))
+
+# relative change/difference
+nri <- nri %>%
+  group_by(Fips) %>%
+  arrange(Year, .by_group=T) %>%
+  mutate(mean_erosion= mean(water_erosion_tons, na.rm=T),
+         lag_erosion = lag(water_erosion_tons),
+         pct_change = ((water_erosion_tons-lag_erosion)/lag_erosion) *100,
+         change = ((water_erosion_tons-lag_erosion)/ ((water_erosion_tons+ lag_erosion)/2))) %>%  # /mean erosion
+  mutate(pct_change = ifelse(is.finite(pct_change), pct_change, NA),
+         change = ifelse(is.finite(change), change, NA)) %>%
+  
+  mutate(mean_pct_change = mean(pct_change, na.rm=T),
+         median_pct_change = median(pct_change, na.rm = T),
+         mean_change = mean(change, na.rm=T),
+         median_change = mean(change, na.rm=T))  %>%
+  ungroup() %>%
+  arrange(Fips, Year) %>%
+  mutate(mean_pct_change = ifelse(is.nan(mean_pct_change), 0, mean_pct_change),
+        median_pct_change = ifelse(is.nan(median_pct_change), 0, median_pct_change),
+        mean_change = ifelse(is.nan(mean_change), 0, mean_change),
+        median_change = ifelse(is.nan(median_change), 0, median_change))
+
+county_map <- county %>%
+  left_join(nri %>%
+              select(Fips, State, County, mean_pct_change, median_pct_change, mean_change, median_change, mean_erosion) %>%
+              distinct(Fips,median_pct_change, .keep_all=T), by="Fips")
+
+nri_trend <- nri %>%
+  group_by(Fips) %>%
+  mutate(n_years = sum(!is.na(water_erosion_tons))) %>%
+  filter(n_years > 5) %>%
+  mutate(erosion_Gg = ((water_erosion_tons* 907.185*1000) / (10^6))) %>%
+  nest() %>%
+  mutate(t = map2(data, "erosion_Gg", mk_name)) %>%
+  unnest(t) %>%
+  dplyr::select(-data) %>%
+  mutate(trend_erosion = ifelse(p_erosion_Gg < 0.1 & tau_erosion_Gg > 0, "increasing", NA),
+         trend_erosion = ifelse(p_erosion_Gg < 0.1 & tau_erosion_Gg < 0, "decreasing", trend_erosion)) %>%
+  mutate(trend_erosion_05 = ifelse(p_erosion_Gg < 0.05 & tau_erosion_Gg > 0, "increasing", NA),
+         trend_erosion_05= ifelse(p_erosion_Gg < 0.05 & tau_erosion_Gg < 0, "decreasing", trend_erosion_05)) %>%
+  ungroup()
+
+nri_trend %>%
+  left_join(county %>%
+              st_set_geometry(NULL), by="Fips") %>%
+  group_by(trend_erosion) %>%
+  summarise(max= max(abs(sen_erosion_Gg)/5,na.rm=T),
+            min =min(abs(sen_erosion_Gg)/5,na.rm=T),
+            med=median(abs(sen_erosion_Gg)/5,na.rm=T))
+
+county_trend <-county %>%
+  left_join(nri_trend, by="Fips")
+
+#write_feather(nri_trend, "D:/Dropbox/projects/riverTSS/out/nri_trend_v1.feather")
+
+# slope in Gg/yr
+ggplot()+
+  geom_sf(data=county_trend %>%
+            filter(!is.na(trend_erosion)) %>%
+            st_transform(2163), 
+          aes(fill=sign(sen_erosion_Gg) * log10(abs(sen_erosion_Gg/5))), color="transparent") +
+ scale_fill_gradient2(
+  low = "dodgerblue",
+  mid = "white",
+  high = "goldenrod",
+  midpoint = 0, na.value="grey90") +
+  labs(fill="") +
+    geom_sf(data=county_trend %>%
+            filter(is.na(trend_erosion)) %>%
+            st_transform(2163), fill="white", color="transparent") 
+
+
+nri_change <- nri %>%
+  group_by(Fips) %>%
+  filter(Year==min(Year, na.rm=T)|Year==max(Year, na.rm=T)) %>%
+  mutate(erosion_Gg = ((water_erosion_tons* 907.185*1000) / (10^6))) %>%
+  dplyr::select(Fips, State, County, Year, erosion_Gg) %>%
+  pivot_wider(names_from = Year, values_from = erosion_Gg, names_prefix = "erosion_" )  %>%
+  mutate(change_Gg = erosion_2015-erosion_1982) %>%
+  mutate(change_perc =((erosion_2015-erosion_1982)/ erosion_1982) *100) %>%
+  ungroup() %>%
+  mutate(trend = ifelse(change_Gg <0, "decrease", "increases")) %>%
+  left_join( county %>%
+               st_set_geometry(NULL) %>%
+               dplyr::select(ALAND, Fips), by="Fips")
+
+nri_change %>%
+  group_by(trend) %>%
+  summarise(area = sum(ALAND, na.rm = T)) %>%
+  mutate(perc = area/sum(area, na.rm=T))
+#
+nri_huc4 <- county %>% 
+  left_join(nri_change, by="Fips") %>%
+  st_join(huc4 %>%
+            st_make_valid(), largest=TRUE)
+
+nri_huc4_sum <- nri_huc4 %>%
+  st_set_geometry(NULL) %>%
+  group_by(HUC4) %>%
+  summarise(erosion_1982 = sum(erosion_1982),
+            erosion_2015 = sum(erosion_2015),
+            AREASQKM = AREASQKM[1] ) %>%
+  mutate(change_Gg = erosion_2015-erosion_1982) %>%
+  mutate(change_perc =((erosion_2015-erosion_1982)/ erosion_1982)*100) %>%
+    mutate_all(~replace_na(., 0)) 
+
+#
+nri_trend_huc4 <- county %>% 
+  left_join(nri_trend, by="Fips") %>%
+  st_join(huc4 %>%
+            st_make_valid(), largest=TRUE)
+
+# sen slope, net percent area change
+nri_trend_huc4_sum <- nri_trend_huc4 %>%
+  st_set_geometry(NULL) %>%
+  mutate(county_sqkm = ALAND/10^6) %>%
+  group_by(HUC4) %>%
+  summarise(erosion_inc = sum(county_sqkm[trend_erosion_05=="increasing"], na.rm=TRUE),
+            erosion_dec = sum(county_sqkm[trend_erosion_05=="decreasing"], na.rm=TRUE),
+            erosion_sen_inc = mean(sen_erosion_Gg[trend_erosion_05=="increasing"], na.rm=TRUE),
+            erosion_sen_dec = mean(sen_erosion_Gg[trend_erosion_05=="decreasing"], na.rm=TRUE),
+            erosion_sen_net = mean(sen_erosion_Gg[!is.na(trend_erosion_05)], na.rm=TRUE),
+            AREASQKM = AREASQKM[1],
+            total_sqkm = sum(county_sqkm, na.rm=TRUE)) %>%
+  ungroup() %>%
+  mutate(p_inc_erosion= (erosion_inc/total_sqkm)*100,
+         p_dec_erosion=(erosion_dec/total_sqkm) *100,
+         p_erosion_net = ((erosion_inc-erosion_dec)/total_sqkm)*100) %>%
+    mutate_all(~replace_na(., 0)) 
+
+huc4_usa <- st_intersection(huc4 %>%
+                              st_transform(4326) %>%
+                              st_make_valid(), 
+                            usa %>% 
+                              st_transform(4326) %>%
+                              st_make_valid())
+
+```
+
+```{r drivers}
+# break flow, erosion, TSS trends into huc46
+library(lwgeom)
+
+huc2 <-  sf::st_read("G:/wbdhu2_a_us_march2017.gdb", layer="WBDHU2") %>%
+    filter(HUC2 %in% c("01", "02", "03", "04", "05", "06", "07", "08", "09","10", "11", "12", "13", "14", "15", "16", "17", "18")) %>%
+  mutate(HUC2 = as.character(HUC2)) %>%
+  mutate(basin = case_when(
+    HUC2 %in% c("05","06", "07", "08", "10", "11") ~ "Miss",
+    HUC2 %in% c("14", "15") ~ "Colorado",
+    TRUE ~ HUC2
+  )) %>%
+  sf::st_make_valid() %>%
+  st_transform(2163) %>%
+  st_buffer(10) %>%
+  group_by(basin) %>%
+  summarise() %>%
+  ungroup() 
+
+huc2_usa <- st_intersection(huc2 %>% st_transform(4326), usa %>% 
+                              st_transform(4326) %>%
+                              st_make_valid())
+
+##
+dam_huc4 <- flowline_full %>%
+  st_set_geometry(NULL) %>%
+  #dplyr::select(COMID, LENGTHKM) %>%
+  left_join(nabd2, by = "COMID") %>%
+  left_join(nhd_huc, by="COMID" ) %>%
+  group_by(HUC04) %>%
+  summarise(n_dams = sum(!is.na(NIDID)),
+            length=sum(LENGTHKM),
+            total_storage = sum(STORAGE, na.rm=T),
+            median_storage = median(STORAGE, na.rm=T),
+            median_height = median(HEIGHT, na.rm=T)) %>%
+    ungroup() %>%
+  left_join(huc4 %>%
+              st_set_geometry(NULL) %>%
+              dplyr::select(HUC4, AREASQKM), by=c("HUC04"="HUC4")) %>%
+  mutate(storage_mm = ((total_storage/810713.18210885)/AREASQKM)*10^6) %>%
+  mutate(storage_med_mm = ((median_storage/810713.18210885)/AREASQKM)*10^6) %>%
+  mutate(storage_km2 = (total_storage/810713.18210885)/length) %>%
+  mutate(dam_density = n_dams/length)
+  
+
+##
+#huc4_cat  <- streamCat_grwl %>%
+#left_join(nhd_huc, by="COMID") %>%
+#  group_by(HUC04) %>%
+#  filter(WsAreaSqKm == max(WsAreaSqKm, na.rm=TRUE))
+
+### join huc to tss trend
+tss_trend_huc4 <- flowline_trend %>%
+  st_set_geometry(NULL) %>%
+  left_join(nhd_huc %>%
+              dplyr::select(COMID, HUC02, HUC04, HUC06), by= "COMID")  %>%
+  group_by(HUC04) %>%
+  summarise(tss_inc = sum(LENGTHKM_[trend_median_05=="increasing"], na.rm=TRUE),
+            tss_dec = sum(LENGTHKM_[trend_median_05=="decreasing"], na.rm=TRUE),
+            tss_net = tss_inc-tss_dec,
+            tss_sen_dec = mean(sen_tss_median[trend_median_05=="decreasing"], na.rm=TRUE),
+            tss_sen_inc = mean(sen_tss_median[trend_median_05=="increasing"], na.rm=TRUE),
+            tss_sen_net= mean(sen_tss_median[!is.na(trend_median_05)], na.rm=TRUE),
+            total_length = sum(LENGTHKM_)
+            ) %>%
+  ungroup() %>%
+  mutate(p_dec_tss = (tss_dec/total_length)*100,
+         p_inc_tss = (tss_inc/total_length)*100,
+         p_net_tss = ((tss_inc-tss_dec)/total_length)*100 )
+
+###
+flow_trend_huc4 <- flow_trends %>%
+  group_by(huc4) %>%
+  summarise(n = n(), 
+            n_none = sum(trend_median_05=="none"),
+            n_inc = sum(trend_median_05=="increasing"),
+            n_dec = sum(trend_median_05=="decreasing"),
+            n_net = n_inc-n_dec,
+            sen_flow_inc = mean(sen_median_flow[trend_median_05=="increasing"]),
+            sen_flow_dec = mean(sen_median_flow[trend_median_05=="increasing"]),
+            sen_flow_net = mean(sen_median_flow[trend_median_05!="none"])) %>%
+  ungroup() %>%
+  mutate(p_dec_flow = (n_dec/n) *100,
+         p_inc_flow = (n_inc/n) * 100,
+         p_net_flow = ((n_inc-n_dec)/n)*100)
+  
+# john huc to flow tren
+huc4_trends <- tss_trend_huc4 %>%
+  inner_join(nri_trend_huc4_sum, by=c("HUC04"="HUC4")) %>%
+  inner_join(nri_huc4_sum, by=c("HUC04"="HUC4")) %>%
+  inner_join(flow_trend_huc4, by=c("HUC04" = "huc4")) %>%                       
+  inner_join(dam_huc4, by="HUC04") %>%
+  mutate(storage_mm_mod =log10(1+ storage_mm)) %>%
+  mutate(driver = case_when(
+    p_net_tss <0 & n_net <0  & p_erosion_net >=0 & storage_mm <=1~"flow",
+    p_net_tss <0 & n_net >=0 & p_erosion_net <=0 & storage_mm <=1~"erosion",
+    p_net_tss <0 & n_net >=0 & p_erosion_net >=0 & storage_mm >1~"dams",
+    p_net_tss <0 & n_net <0  & p_erosion_net <=0 & storage_mm <=1~"flow+erosion",
+    p_net_tss <0 & n_net <0  & p_erosion_net >=0 & storage_mm >1~"flow+dams",
+    p_net_tss <0 & n_net >=0 & p_erosion_net <=0 & storage_mm >1~"erosion+dams",
+    p_net_tss <0 & n_net <0 & p_erosion_net <=0 & storage_mm >1~"flow+erosion+dams",
+    p_net_tss>0 ~ "increase"))
+
+flowline_huc4 <- flowline_full %>%
+  left_join(nhd_huc %>%
+              dplyr::select(-ID), by="COMID") %>%
+  left_join(huc4_trends %>%
+              dplyr::select(HUC04, driver), by="HUC04") %>%
+  left_join(trends_tss_annual, by = "ID") %>%
+  mutate(tss_trend = ifelse(trend_median_05=="decreasing", "decreasing", "not")) %>%
+  mutate(tss_trend = ifelse(is.na(tss_trend), "not", tss_trend))
+
+flowline_huc4 %>%
+  st_set_geometry(NULL) %>%
+  filter(trend_median_05=="decreasing") %>%
+  group_by(driver) %>%
+  summarise(count= sum(LENGTHKM)) %>%
+  mutate(p = count/sum(count))
+
+
+#flowline_huc4$driver <- factor(flowline_huc4$driver, levels = c("dams", "erosion", "flow", "erosion+dams","flow+erosion", "flow+dams", "flow+erosion+dams"))
+library(RColorBrewer)
+
+ggplot()+
+  geom_sf(data=usa, fill="black", color="transparent") +
+  geom_sf(data=flowline_huc4 %>%
+            filter(trend_median_05 %in% c(NA, "increasing")) %>%
+            st_transform(2163), 
+          color="grey40", lwd=0.2) +
+
+  geom_sf(data=flowline_huc4 %>%
+            filter(trend_median_05 =="decreasing") %>%
+            filter(!is.na(driver)) %>%
+            st_transform(2163),
+          aes(color=driver)) +
+ scale_color_manual(values = c("#FDC086", "#386CB0","#BEAED4","#F0027F","#BF5B17", "#FFFF99", "#7FC97F" )) +
+  # scale_color_brewer(palette = "Accent", na.value="grey") +
+   theme( legend.position = c(1,0.25),
+    legend.background = element_rect(fill="black"),
+    line = element_blank(), 
+    rect = element_blank(), 
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    plot.background = element_blank(),
+    legend.text = element_text(size=6, color = "white"),
+    legend.title = element_blank(),
+    #legend.key.size = unit(2, "cm"),
+    legend.key.height = unit(0.25, "cm")) +
+   guides(color = guide_legend(override.aes = list(size = 2)))
+  #  guides(color = guide_legend(keyheight=5))
+       
+   
+#ggsave("D:/Dropbox/projects/riverTSS/figs/tss_drivers_v2.png", width=6, height=3, units="in", dpi=350)
+
+ggplot(flowline_huc4 
+       %>% st_set_geometry(NULL) %>%
+            filter(trend_median_05 =="decreasing") %>%
+            filter(!is.na(driver))) +
+  geom_density(aes(abs(sen_tss_median), fill=driver), color="black", alpha=0.5) +
+  theme_bw()+
+  scale_x_log10()
+
+flowline_huc4$driver <- factor(flowline_huc4$driver, levels = c("flow", "flow+erosion", "erosion", "flow+dams", "flow+erosion+dams","erosion+dams", "dams" ))
+
+flowline_huc4  %>% 
+  st_set_geometry(NULL) %>%
+  filter(trend_median_05 =="decreasing") %>%
+  filter(!is.na(driver)) %>%
+  group_by(driver) %>%
+  summarise(mean=mean(sen_tss_median, na.rm=T),
+            med=median(sen_tss_median, na.rm=T), 
+            sd=sd(sen_tss_median, na.rm=T),
+            n=n()) %>%
+  arrange(med)
+
+
+library(ggridges)
+library(EnvStats)
+
+ggplot(flowline_huc4 %>%
+         st_set_geometry(NULL) %>%
+            filter(trend_median_05 =="decreasing") %>%
+            filter(!is.na(driver)),
+       aes(y=driver, x=abs(sen_tss_median), fill=driver)) +
+  geom_density_ridges( color="black", alpha=0.95) +
+  theme_bw()+
+   scale_fill_manual(values = c("#FDC086", "#386CB0","#BEAED4","#F0027F","#BF5B17", "#FFFF99", "#7FC97F" )) +
+  # scale_fill_brewer(palette = "Accent", na.value="grey") +
+  scale_x_log10() +
+  xlab("Rate of change (mg/L/yr)") +
+  ylab("") +
+  theme(legend.position = "none",
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) # +
+  # geom_text(data=flowline_huc4 %>%
+  #        st_set_geometry(NULL) %>%
+  #           filter(trend_median_05 =="decreasing") %>%
+  #           filter(!is.na(driver)) %>% 
+  #           group_by(driver) %>% 
+  #           summarise(sen_tss_median=n(),
+  #                     med=median(sen_tss_median, na.rm=T)),
+  #           aes(label=sprintf("n=%s", sen_tss_median), x=0.025), 
+  #           position=position_nudge(y=-0.15), colour="black", size=2.5)
+
+#ggsave("D:/Dropbox/projects/riverTSS/figs/tss_drivers_hist_noylab.png", width=2.5, height=3, units="in", dpi=350)
+
+```
+
+
+
+```{r basin_coast_link}
+
+
+
+trends_predict <- trends_tss_annual %>%
+ inner_join(flowline %>%
+               st_set_geometry(NULL), by="ID") %>%
+    mutate(trend_median_05 = ifelse(is.na(trend_median_05), "none", trend_median_05)) %>%
+
+
+flowline_trend <- flowline %>%
+ st_transform(2163) %>%
+  inner_join(trends_tss_annual, by= "ID") %>%
+  mutate(trend_median_05 = ifelse(is.na(trend_median_05), "none", trend_median_05)) %>%
+  mutate(trend = paste0(trend_median_05, Tidal, sep="_"))
+
+
+term_rates <- trends_predict %>%
+  filter(Tidal==0) %>%
+  group_by(TermnlP) %>%
+  summarise(length= sum(LENGTHKM_, na.rm=T),
+            length_dec= sum(LENGTHKM_[trend_median_05=="decreasing" ]),
+            count=n(),
+            count_dec = sum(trend_median_05=="decreasing"),
+            rate_dec = mean(sen_tss_median[ trend_median_05=="decreasing"]),
+            frac_dec = count_dec/(count ),
+            frac_l = length_dec/(length)) %>%
+  inner_join(trends_predict %>%
+  filter(Tidal==1) %>%
+  group_by(TermnlP) %>%
+  summarise(length_tidal= sum(LENGTHKM_, na.rm=T),
+            count_tidal=n(),
+            length_dec_tidal= sum(LENGTHKM_[trend_median_05=="decreasing" ]),
+            count_dec_tidal = sum(trend_median_05=="decreasing"),
+            rate_dec_tidal = mean(sen_tss_median[ trend_median_05=="decreasing"]),
+            frac_dec_tidal = count_dec_tidal/(count_tidal),
+            frac_l_tidal = length_dec_tidal/(length_tidal)), by="TermnlP") %>%
+  filter(!is.na(length_tidal)) %>%
+  mutate(tp = case_when(
+            TermnlP %in% c(250002851, 250003390, 250002964, 630001920,
+                           350003395,  290003274, 200005762, 150003172, 250003618, 50010954, 250002682, 10003452, 200004599, 630001729, 680000035, 50010545, 150002434, 270005079, 50013626, 270004768,  150003157, 250005904, 270003673) ~ "low",
+            TRUE ~ "mid"
+          )) %>%
+  left_join(path_sum %>%
+              dplyr::select(-max_path, -min_path), by=c("TermnlP"="LevelPathI")) %>%
+  #left_join(dam_per_term, by=c("TermnlP"="TerminalPa")) # %>%
+
+ggplot(term_rates %>%
+         filter(frac_l !=0, frac_l_tidal !=0)) + 
+  geom_point(aes(x=frac_l*100, y=frac_l_tidal*100, color=tp), size=1.5)  +
+  geom_smooth(method="lm", aes(x=frac_l*100, y=frac_l_tidal*100, color=tp)) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position="right")+
+  xlab("% fluvial rivers with decreasing TSS")+
+  ylab("% tidal rivers with decreasing TSS")    #+
+
+#ggsave("D:/Dropbox/projects/riverTSS/figs/FigS_frac_dec.png", width=3.5, height=3.5 ,units="in", dpi=350)
+
+mod <- lm(frac_l_tidal ~ frac_l, data=term_rates %>%
+            filter(frac_l_tidal !=0, frac_l !=0)%>%
+            filter(tp=="mid"))
+
+mod1 <- lm(frac_l_tidal ~ frac_l, data=term_rates  %>%
+            filter(frac_l_tidal !=0, frac_l !=0) %>%
+            filter(tp=="low"))
+
+summary(mod1)
+summary(mod)
+
+
+
+
+elev_test <- flowline %>%
+          inner_join(term_rates, by="TermnlP") %>%
+  st_set_geometry(NULL) %>%
+  filter(tp != "zero")
+
+  ggplot(elev_test) +
+  geom_density(aes((MAXELEVS*0.01),  fill=tp), color="black", alpha=0.5)+
+  scale_fill_manual(values = c("dodgerblue", "goldenrod")) +
+  theme_bw()+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position="none") +
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x),
+   labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  xlab("River elevation (m)")+
+  ylab("Density")
+  
+#ggsave("D:/Dropbox/projects/riverTSS/figs/FigS_elev.png", width=3.5, height=3.5 ,units="in", dpi=350)
+
+  
+ggplot(term_rates %>%
+                 #filter(length >=50 & length_tidal >=5) %>%
+                filter(length_dec_tidal > 0, length_dec>0)) +# %>%
+               #filter(tp != "none"))+ 
+    geom_point(aes(x=length_dec, y=length_dec_tidal, color=log10(max_Area)), size=1.5) +
+  geom_smooth(method="lm", aes(x=(length_dec), y=(length_dec_tidal))) +
+ # scale_color_manual(values = c("dodgerblue", "goldenrod")) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position="none")+
+  xlab("Fluvial length with decreasing TSS (km)")+
+  ylab("Tidal length with decreasing TSS (km)") +
+  scale_x_log10() +
+  annotation_logticks(sides="b") 
+
+#ggsave("D:/Dropbox/projects/riverTSS/figs/FigS_fluc_tidal_lenghh.png", width=3.5, height=3.5 ,units="in", dpi=350)
+
+
+
+
+
+
+
+
+
+```
+

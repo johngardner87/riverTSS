@@ -1,0 +1,494 @@
+---
+title: "feature_selection"
+author: "John Gardner and Simon Topp"
+date: "November 18, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(googledrive)
+library(tidyverse)
+library(feather)
+library(viridis)
+library(knitr)
+library(sf)
+library(rgdal)
+library(maps)
+library(magrittr)
+library(mlbench)
+library(caret)
+library(randomForest)
+library(doParallel)
+library(onehot)
+library(xgboost)
+library(Metrics)
+library(purrr)
+library(data.table)
+library(tmap)
+library(mltools)
+library(ggthemes)
+library(dplyr)
+library(dataRetrieval)
+library(ggplot2)
+library(mltools)
+library(CAST)
+library(future)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r prepdata}
+
+iter <- "xgbLinear_alltypes_no_ssc_v1"
+
+cons.out <- read_feather('D:/Dropbox/projects/riverTSS/3_prepdata/out/parametersMunged_corrected_v4.feather') 
+
+outliers <- read_csv("D:/Dropbox/projects/riverTSS/2_model/out/models/all_types_no_ssc_method_outliers.csv") 
+
+# Filter matchups to high quality data and remove outliers
+data <- cons.out %>%
+  filter(!uniqueID %in% outliers$uniqueID) %>%
+  mutate(timediff= timediff / (60*60)) %>%
+  filter(parameter == "tss") %>%
+  filter(!is.na(value)) %>%
+ filter(!analytical_method %in% c("UNKOWN", "SSC by filtration (D3977;WI WSC)", "Sediment conc by evaporation", "Historic", "Filterable Residue - TDS", "Cheyenne River Sioux Tribe Quality Assurance Procedures")) %>%
+  group_by(analytical_method) %>%
+  mutate(n=n()) %>%
+  filter(n > 10) %>%
+  ungroup() %>%
+  filter( dswe <=1)  %>%
+  filter(hillshadow ==1 | is.na(hillshadow)) %>%
+    filter (type == "Estuary" &  between(timediff, -7, 7) |
+          type %in% c("Lake", "Facility") & between(timediff, -20, 20) |
+          type == "Stream" & between(timediff, -20, 20) 
+            ) %>%
+  filter(type == "Lake"  & !is.na(COMID_lake) |
+           type %in% c("Stream", "Facility", "Estuary") &     is.na(COMID_lake)) %>%
+  filter(value > 0.1, value < 20000) %>%
+  filter(type == "Stream" & !value %in% c(1,2,3,4,5) |
+          type %in% c("Lake", "Facility", "Estuary") ) %>%
+  filter(type == "Stream" & offset < 0.05 | 
+          type == "Lake" & offset <0.2 |
+          is.na(offset) )  %>%
+  filter(TotDASqKM > 50 | is.na(TotDASqKM)) %>%
+  filter(!grepl("USGS", SiteID) & !grepl("SSC", characteristicName)) 
+
+
+# split data representatively across time, space, concentration for train/validation
+holdout <- function(x) {
+
+  x <- x %>%
+  group_by(long_group, time_group) %>%
+  dplyr::mutate(mag = cut(value, quantile(
+  x = value,
+  c(0, 0.2, 0.4, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.93, 0.96, 1),
+  include.lowest = T
+  )),
+  mag = factor(
+  mag,
+  labels = c(0.2, 0.4, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.93, 0.96, 1)
+  )) %>%
+  ungroup()
+  
+  set.seed(22)
+  
+  train <- x %>%
+  group_by(time_group, long_group, mag) %>%
+  sample_frac(.9) %>%
+  ungroup() %>%
+  dplyr::mutate(.partitions = 1)
+  
+  validate <- x %>%
+   anti_join(train) %>%
+   dplyr::mutate(.partitions = 2)
+
+  out <- train %>%
+  bind_rows(validate) 
+    
+  return(out)
+}
+
+# make training and validation data
+df <- data %>%
+  mutate(lat_group = cut_number(lat, 2, right= F),
+         long_group = cut_number(long, 3, right=F),
+         date = lubridate::ymd(date),
+         julian = as.numeric(julian.Date(date)),
+         #group_by(lat_group) %>%
+         #mutate(long_group = cut_number(long, 3, right=F)) %>%
+         space_group = paste0(lat_group,long_group),
+         time_group = cut_number(julian, 3, right=F)) %>%
+         holdout() %>% 
+         ungroup() %>%
+         mutate(value = log(value)) %>%
+         mutate_if(is.character,as.factor) %>%
+         as.data.frame()
+
+train <- df %>%
+  filter(.partitions ==1) %>% 
+  ungroup() %>%
+  as.data.frame()
+
+validate <- df %>%
+  filter(.partitions ==2) %>%
+  ungroup() %>%
+  as.data.frame()
+
+val.cols <- df %>% 
+  filter(.partitions ==2) %>%
+  ungroup() 
+
+```
+
+```{r}
+# make map of matchup locations
+data_map <- data %>% 
+  group_by(SiteID,lat, long) %>%
+  summarise(Count = n()) %>%
+  st_as_sf(coords = c(x="long", y="lat"), crs=4326) %>%
+  st_transform(2163) %>%
+  mutate(Count = log10(Count))
+
+ggplot() +
+  geom_sf(data=usa, color="black", fill="white") +
+  geom_sf(data=data_map, aes(color=Count), alpha=0.5, size=0.8) +
+  scale_color_viridis() +
+  scale_color_viridis_c(breaks = c(0,1,100), labels=c(1, 10, 100)) +
+  theme(legend.position = c(0.98, 0.29),
+    line = element_blank(), 
+    rect = element_blank(), 
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    plot.background = element_blank(),
+    legend.text = element_text(size=9))
+
+
+#ggsave("D:/Dropbox/projects/riverTSS/figs/sampling_density.png", width=6, height=3, units="in", dpi=300)
+
+
+```
+
+
+
+```{r ffs, echo=F, message=F}
+
+# select features to use in feature selection
+features <- data %>%
+  dplyr::select( blue, green, red, nir, swir1, swir2, NR:dw) %>%
+  dplyr::select(-NS_NR) %>%
+  names(.)
+
+#
+set.seed(10)
+
+folds <- CreateSpacetimeFolds(train,
+  spacevar = "long_group",
+  timevar = "time_group" ,
+  k = 3)
+  
+control <- trainControl(
+  method = "cv",
+  savePredictions = 'none',
+  returnResamp = 'final',
+  index = folds$index,
+  indexOut = folds$indexOut,
+  p = 0.8)
+  
+  ## Do initial feature selection with conservative hyperparameters
+tuneGrid1 <- expand.grid(
+  nrounds = 300,
+  eta = .1,
+  lambda = 0,
+  alpha = 0)
+
+
+# Set it up to run in parallel. This can take 1-2 days.
+cl <- makePSOCKcluster(availableCores() - 2)
+registerDoParallel(cl)
+
+ffs <- ffs(df[,features], df$value, method = 'xgbLinear', metric = 'RMSE', tuneGrid = tuneGrid1, Control = control, verbose = T)
+
+on.exit(stopCluster(cl))
+registerDoSEQ()
+
+ffsResults <- ffs$perf_all
+
+# Save the results
+#write_feather(ffsResults, paste0('4_model/out/ffsResults_',iter,'.feather'))
+#save(ffs, file=paste0('4_model/out/ffs_',iter,'.RData'))
+
+ffsResults %>%
+  group_by(nvar) %>%
+  summarise(RMSE = median(RMSE),
+            SE = median(SE)) %>%
+  ggplot(.) + geom_line(aes(x = nvar, y = RMSE)) +
+  geom_errorbar(aes(x = nvar, ymin = RMSE - SE, ymax = RMSE + SE), color = 'red')
+
+#ggsave(paste0('figs/rfeRMSE_', iter, '.png'), device = 'png', width = 6, height = 4, units = 'in')
+
+```
+
+
+```{r final_model}
+
+ffsResults <- read_feather(paste0('4_model/out/ffsResults_xgbLinear_alltypes_no_ssc_no_land','.feather'))
+
+features_1 <- ffsResults[ffsResults$RMSE == min(ffsResults$RMSE),] %>%
+  dplyr::select(-c(nvar, RMSE, SE)) %>%
+  paste(.) %>% .[.!= 'NA']
+
+grid_base <- expand.grid(
+  nrounds = seq(100,500,100),
+  alpha = c(0.01, 0.1, 0.5, 1),
+  lambda = c(0.01, 0.1, 0.5, 1),
+  eta = c(0.05, 0.1, 0.3)
+)
+
+set.seed(10)
+
+folds <- CreateSpacetimeFolds(train, spacevar = "long_group", timevar = "time_group" , k=3)
+
+#Set up a cluster to run everything in parallel
+cl <- makePSOCKcluster(availableCores()-2)
+registerDoParallel(cl)
+
+train_control <- caret::trainControl(
+  method = "cv",
+  savePredictions = F,
+  returnResamp = 'final',
+  index = folds$index,
+  indexOut = folds$indexOut,
+  verboseIter = T,
+  allowParallel = TRUE,
+  p = 0.8
+  )
+  
+base_model <- caret::train(
+  x = df[,features_1],
+  y = df$value,
+  trControl = train_control,
+  tuneGrid = grid_base,
+  method = "xgbLinear",
+  verbose = TRUE,
+ # preProcess = c('center', 'scale'),
+  importance = F
+)
+
+base_model$bestTune
+
+# 
+train_control_final <- caret::trainControl(
+  method = "cv",
+  savePredictions = T,
+  returnResamp = 'final',
+  index = folds$index,
+  indexOut = folds$indexOut,
+  verboseIter = T,
+  allowParallel = TRUE,
+  p = 0.8
+  )
+  
+grid_final <- expand.grid(
+  nrounds = base_model$bestTune$nrounds,
+  alpha = base_model$bestTune$alpha,
+  lambda = base_model$bestTune$lambda,
+  eta = base_model$bestTune$eta
+)
+
+model <- caret::train(
+  x = df[,features_1],
+  y = df$value,
+  trControl = train_control_final,
+  tuneGrid = grid_final,
+  method = "xgbLinear",
+ # preProcess = c('center', 'scale'),
+  importance = T,
+  verbose = TRUE
+)
+
+stopCluster(cl)
+
+# helper function for plot
+tuneplot <- function(x, probs = .90) {
+  ggplot(x) +
+    coord_cartesian(ylim = c(quantile(x$results$RMSE, probs = probs), min(x$results$RMSE))) +
+    theme_bw()
+}
+
+tuneplot(base_model)
+
+#ggsave(paste0("D:/Dropbox/projects/riverTSS/figs/base_tune_",iter, ".tiff"), width=10, height = 8, units="in", dpi=300)
+
+
+```
+
+
+```{r save}
+
+pred<- predict( model, validate[,features_1])
+actual <- (validate$value)
+uniqueID <- val.cols$uniqueID
+
+output <- tibble(Predicted = pred, Actual = actual,uniqueID = uniqueID) %>%
+  mutate(Actual = exp(Actual), Predicted = exp(Predicted)) %>%
+  left_join(cons.out %>%
+              dplyr::select(-c(TOT_BASIN_AREA:TOT_WB5100_ANN)), by="uniqueID") %>%
+  mutate(residual = Actual - Predicted,
+         year = year(date),
+         month = month(date),
+         obs = ifelse(abs(residual) > quantile(abs(residual), .975, na.rm=T), "bad", "good")) %>%
+  mutate(iteration = iter)
+
+### save all training data
+#write_feather(train, path = paste0('D:/Dropbox/projects/riverTSS/4_model/out/train_',iter, '.feather'))
+#write_csv(train, path = paste0('D:/Dropbox/projects/riverTSS/4_model/out/train_',iter, '.csv'))
+
+### save just features and response variable that are used
+#write_feather(train %>% select(value, features_1), path = paste0('D:/Dropbox/projects/riverTSS/4_model/out/train_clean_',iter, '.feather'))
+#write_csv(train %>% select(value, features_1), path = paste0('D:/Dropbox/projects/riverTSS/4_model/out/train_clean_',iter, '.csv'))
+
+### save matchup databse used in model
+#write_feather(df, path ='4_model/out/Aqusat_TSS_v1.feather')
+#write_csv(df, path = '4_model/out/Aqusat_TSS_v1.csv')
+
+### save output of validation model
+#write_feather(output, path = paste0('D:/Dropbox/projects/riverTSS/4_model/out/output_',iter, '.feather'))
+#write_csv(output, path = paste0('D:/Dropbox/projects/riverTSS/4_model/out/output_',iter, '.csv'))
+
+### save the model
+#save(model, file = paste0('4_model/out//finalmodel_',iter, '.Rdata'))
+#saveRDS(model, file = paste0('4_model/out/finalmodel_',iter, '.rds'))
+
+iter <- "xgbLinear_alltypes_no_ssc_v1"
+model <-readRDS(paste0('D:/Dropbox/projects/riverTSS/2_model/out/finalmodel_',iter, '.rds'))
+
+
+aquasat <- read_feather('D:/Dropbox/projects/riverTSS/2_model/out/Aqusat_TSS_v1.feather')
+
+```
+
+
+```{r eval}
+
+evals <- output %>%
+  filter(Actual < 3000) %>%
+  mutate(Actual = (Actual), 
+         Predicted = (Predicted)) %>%
+  summarise(rmse = rmse(Actual, Predicted),
+            mae = mae(Actual, Predicted),
+            mape = mape(Actual, Predicted),
+            bias = bias(Actual, Predicted),
+            p.bias = percent_bias(Actual, Predicted),
+            smape = smape(Actual, Predicted)) 
+
+evals %>% kable(digits = 2) %>% kable_styling() %>% scroll_box(width = '4in')
+
+mod <-lm(log10(Predicted) ~ log10(Actual), data = output %>%  filter( Actual < 3000))
+summary(mod)
+
+ggplot(output %>% filter(Actual!=1), aes(x = (Actual), y = (Predicted))) + 
+  scale_x_log10(limits=c(1,3000))+
+  scale_y_log10(limits=c(1,3000)) +
+  geom_hex(aes(fill = log10(..count..))) + 
+  scale_fill_viridis(name = 'Log10(Count)') + 
+  geom_abline(slope=1, intercept = 0, color = 'black')+
+  xlab("Measured TSS (mg/L)") +
+  ylab("Predicted TSS (mg/L)")+
+  theme_few() +
+  theme(text = element_text(size=18),
+        legend.position = c(0.25,0.75),
+        legend.background = element_blank()) 
+  #facet_wrap(~sat)
+
+#ggsave('D:/Dropbox/projects/riverTSS/figs/ModelValidation_density.png', width = 5, height = 5, units = 'in' ,dpi=350)
+
+ggplot(output %>% filter(Actual<3000), aes(x = year, y = residual)) + 
+  geom_point() +
+  xlab("year") +
+  ylab("Residual")+
+  theme_few() +
+  theme(text = element_text(size=18))
+  
+errorSum <- output %>%
+  filter( Actual < 3000) %>%
+  mutate(Observed.Value = Actual) %>%
+  rename(Year = year, Latitude = lat, Longitude = long) %>%
+  mutate(Longitude = round(Longitude, 1)) %>%
+  gather(Observed.Value, Year, Latitude, Longitude, key = 'Variable', value = 'Value') %>%
+  group_by(Variable) %>%
+  mutate(quantile = ifelse(Variable == "Observed.Value", 
+                   cut_number(Value, n=5, right = F, breaks= c(0, 10, 100,1000, 10000, 20000), labels = F),
+                   cut_number(Value, n=4, right = F, labels = F))) %>%
+    mutate(quantLabs = ifelse(Variable == "Observed.Value", as.character(case_when(
+      quantile == 1 ~ "0-10",
+      quantile == 2 ~ "10-100",
+      quantile == 3 ~ "100-1000",
+      quantile == 4  ~ "1k-10k",
+      quantile == 5  ~ "outlier"
+    )),
+    as.character(cut_number(Value, 4,  right = F, dig.lab = 3)))) %>% 
+ ungroup() %>%
+  group_by(quantile, quantLabs, Variable) %>%
+  dplyr::summarise(rmse = rmse(Actual, Predicted),
+            mae = mae(Actual, Predicted),
+            bias = bias(Actual, Predicted),
+            smape = smape(Actual, Predicted),
+            p.bias = percent_bias(Actual, Predicted)
+            ) %>%
+  gather(rmse:p.bias, key = 'Metric', value = 'Error') %>%
+  as.data.frame() %>%
+  arrange(Variable, quantile) %>%
+  mutate(order = row_number())
+
+ggplot(errorSum %>% 
+         filter(quantLabs != "outlier") %>%
+         filter(Metric == 'smape'|Metric =='p.bias'|Metric=="mae") %>%
+         mutate(Error = ifelse(Metric %in% c("smape", "p.bias"), Error*100, Error)), aes(x = fct_reorder(quantLabs,order), y = Error, color = Metric, group = Metric)) + 
+  geom_point() + 
+  geom_line() + 
+  facet_wrap(~Variable, scales = 'free')  +  
+  theme_bw() +
+  scale_color_viridis(discrete = T) +
+  #scale_y_continuous(labels = scales::percent) +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5),
+        legend.position = 'bottom') +
+  labs(x = 'Quantile', y = 'Error (% or mg/L)')
+
+#ggsave("D:/Dropbox/projects/riverTSS/figs/error_groups.tiff", width=6, height = 6, dpi = 300, units= "in")
+
+
+```
+
+
+```{r predict, echo=F, message=F}
+
+# load data SR data
+sr_clean <- read_feather("D:/Dropbox/projects/rivercolor/out/riverSR_usa_v1.1.feather") 
+ 
+#load features
+ffsResults <- read_feather(paste0('4_model/out/ffsResults_no_ssc_no_land','.feather'))
+                           
+features_1 <- ffsResults[ffsResults$RMSE == min(ffsResults$RMSE),] %>%
+  select(-c(nvar, RMSE, SE)) %>%
+  paste(.) %>% .[.!= 'NA']
+
+pred <- tibble(tss = exp(predict(model, sr_clean[,features_1])))
+
+sr_tss <- sr_clean %>%
+  bind_cols(pred) %>%
+  mutate(iteration = iter)
+
+sr_tss <- sr_tss %>%
+  distinct(ID, date, path, row, sat, blue, .keep_all = TRUE) %>%
+  select(LS_ID, ID, date, time, year, month, tss, Cloud_Cover, azimuth, zenith, elevation, hillshadow, dswe, path, row, sat, pixelCount, count,  flag, iteration, rn, qa, blue_raw:swir2, mean_SR)
+
+write_csv(sr_tss, "D:/Dropbox/projects/riverTSS/out/RiverSed_USA_V1.0.txt")
+
+write_feather(sr_tss, "D:/Dropbox/projects/riverTSS/out/RiverSed_USA_V1.0.feather")
+
+
+```
+
+
